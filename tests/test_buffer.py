@@ -281,3 +281,14 @@ async def test_repo_failure_never_silently_drops(app: App, monkeypatch: pytest.M
     monkeypatch.setattr(Repo, "apply_count_batch", real_apply)
     assert await buf.flush()
     assert sum(c for c, _ in (await db_counts(app)).values()) == recorded
+
+
+def test_backoff_never_overflows_on_long_outages(app: App) -> None:
+    """Regression: 2 ** 1024 used to overflow float conversion and kill the flush loop."""
+    from bot.resets.machine import RETRY_MAX_SECONDS, retry_delay
+
+    buf = app.buffer
+    for failures in (1, 10, 1023, 1024, 5000, 10**6):
+        buf.consecutive_failures = failures
+        assert 0 < buf.next_delay() <= 60 * 1.15
+        assert 0 < retry_delay(failures) <= RETRY_MAX_SECONDS * 1.1

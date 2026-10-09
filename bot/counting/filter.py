@@ -1,8 +1,9 @@
 """Message eligibility and excluded-channel resolution.
 
 A message counts when it is a guild message from a human (not a bot, not a
-webhook), of type ``default`` or ``reply``, and neither its channel, its thread
-parent (threads and forum posts), nor the relevant category is excluded.
+webhook), of type ``default`` or ``reply``, created after the guild ran /setup,
+and neither its channel, its thread parent (threads and forum posts), nor the
+relevant category is excluded.
 
 Ancestry is taken from discord.py's channel cache when possible. When it cannot
 be determined from the cache (for example an uncached thread whose message
@@ -16,10 +17,12 @@ from __future__ import annotations
 import logging
 import time
 from collections import OrderedDict
+from datetime import datetime
 from typing import Any, Collection, Protocol
 
 import discord
 
+from bot.clock import ensure_utc
 from bot.counting.buffer import CountBuffer
 from bot.db.repo import Repo
 from bot.discord_ops import ChannelInfo, DiscordOps, OpError
@@ -92,6 +95,34 @@ class ExclusionCache:
             ids.discard(channel_id)
 
 
+class InstallCache:
+    """In-memory mirror of each guild's ``installed_at`` (set by the first /setup).
+
+    Counting only starts at installation: messages in guilds that were never set
+    up, and messages created before ``installed_at``, are not counted. Comparing
+    at message precision keeps the install day exact even though day buckets
+    cannot be split.
+    """
+
+    def __init__(self, repo: Repo) -> None:
+        self._repo = repo
+        self._installed: dict[int, datetime] = {}
+
+    async def load(self) -> None:
+        self._installed = {
+            cfg.guild_id: cfg.installed_at
+            for cfg in await self._repo.list_installed_guilds()
+            if cfg.installed_at is not None
+        }
+        log.info("Counting enabled for %d installed guild(s)", len(self._installed))
+
+    def installed_at(self, guild_id: int) -> datetime | None:
+        return self._installed.get(guild_id)
+
+    def set_installed(self, guild_id: int, installed_at: datetime) -> None:
+        self._installed[guild_id] = installed_at
+
+
 class ChannelResolver:
     """Resolves ancestry for channels missing from the cache, with a small TTL cache."""
 
@@ -131,16 +162,26 @@ class ChannelResolver:
 class MessageCounter:
     """Decides whether a gateway message counts and records it in the buffer."""
 
-    def __init__(self, exclusions: ExclusionStore, resolver: ChannelResolver, buffer: CountBuffer) -> None:
+    def __init__(
+        self,
+        exclusions: ExclusionStore,
+        resolver: ChannelResolver,
+        buffer: CountBuffer,
+        installs: InstallCache,
+    ) -> None:
         self._exclusions = exclusions
         self._resolver = resolver
         self._buffer = buffer
+        self._installs = installs
 
     async def handle(self, message: Any) -> bool:
         """Return ``True`` if the message was counted."""
         if rejection_reason(message) is not None:
             return False
         guild_id = message.guild.id
+        installed_at = self._installs.installed_at(guild_id)
+        if installed_at is None or ensure_utc(message.created_at) < installed_at:
+            return False  # counting starts when /setup is first run
         ancestry = await self._resolver.resolve(guild_id, message.channel)
         if ancestry is None:
             return False

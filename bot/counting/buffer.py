@@ -183,7 +183,8 @@ class CountBuffer:
         """Delay before the next periodic flush: the interval, or bounded backoff after failures."""
         if self.consecutive_failures == 0:
             return self._interval
-        delay = min(self._max_backoff, self._interval * (2 ** self.consecutive_failures))
+        exponent = min(self.consecutive_failures, 16)  # avoid float overflow on long outages
+        delay = min(self._max_backoff, self._interval * (2 ** exponent))
         return delay * random.uniform(0.85, 1.15)
 
     async def run(self, stop: asyncio.Event) -> None:
@@ -195,4 +196,7 @@ class CountBuffer:
                 pass
             if stop.is_set():
                 break
-            await self.flush()
+            try:
+                await self.flush()
+            except Exception:  # pragma: no cover - flush already handles DB errors
+                log.exception("Unexpected error in the periodic flush; continuing")

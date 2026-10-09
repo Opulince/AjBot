@@ -31,7 +31,7 @@ from bot.commands.admin import register_admin_commands
 from bot.commands.stats import register_stats_command
 from bot.config import Config, ConfigError, load_config
 from bot.counting.buffer import CountBuffer
-from bot.counting.filter import ChannelResolver, ExclusionCache, MessageCounter
+from bot.counting.filter import ChannelResolver, ExclusionCache, InstallCache, MessageCounter
 from bot.db.database import Database
 from bot.db.repo import Repo
 from bot.discord_ops import DiscordOps, DiscordPyOps
@@ -110,6 +110,7 @@ class Services:
     ops: DiscordOps
     buffer: CountBuffer
     exclusions: ExclusionCache
+    installs: InstallCache
     counter: MessageCounter
     ranker: Ranker
     boards: BoardService
@@ -123,7 +124,8 @@ def build_services(config: Config, db: Database, ops: DiscordOps, clock: Clock) 
     repo = Repo(db)
     buffer = CountBuffer(repo, flush_interval=config.flush_interval_seconds)
     exclusions = ExclusionCache(repo)
-    counter = MessageCounter(exclusions, ChannelResolver(ops), buffer)
+    installs = InstallCache(repo)
+    counter = MessageCounter(exclusions, ChannelResolver(ops), buffer, installs)
     ranker = Ranker(repo)
     boards = BoardService(repo, ranker, ops, clock)
     machine = ResetMachine(repo, ops, buffer, ranker, clock, grace_seconds=config.reset_grace_seconds)
@@ -137,6 +139,7 @@ def build_services(config: Config, db: Database, ops: DiscordOps, clock: Clock) 
         ops=ops,
         buffer=buffer,
         exclusions=exclusions,
+        installs=installs,
         counter=counter,
         ranker=ranker,
         boards=boards,
@@ -185,6 +188,7 @@ class LeaderboardBot(discord.Client):
         services = build_services(self.config, self.db, DiscordPyOps(self), self.clock)
         self.services = services
         await services.exclusions.load()
+        await services.installs.load()
         register_persistent_items(self)
         register_admin_commands(self.tree, services)
         register_stats_command(self.tree, services)

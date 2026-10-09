@@ -413,6 +413,7 @@ class App:
         await db.connect()
         services = build_services(config, db, fake, clock)
         await services.exclusions.load()
+        await services.installs.load()
         return cls(services)
 
     async def crash(self) -> None:

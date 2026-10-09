@@ -627,6 +627,17 @@ class Repo:
             )
         return int(row["attempts"]) if row else 0
 
+    async def repost_abandon(self, guild_id: int, generation: int, now: datetime) -> None:
+        """Close a POSTING op without touching ``board_messages`` (its target channel is obsolete)."""
+        async with self.db.transaction() as conn:
+            cur = await conn.execute(
+                "UPDATE board_repost SET status = 'DONE', last_error = 'abandoned: board channel changed', "
+                "  updated_at = ? WHERE guild_id = ? AND generation = ? AND status = 'POSTING'",
+                (to_iso(now), guild_id, generation),
+            )
+            if cur.rowcount != 1:
+                raise StaleRunError(f"repost gen {generation} for guild {guild_id} is not POSTING")
+
     async def repost_complete(self, guild_id: int, generation: int, now: datetime, note: str | None = None) -> None:
         """Switch ``board_messages`` to the new boards and mark the operation DONE, atomically."""
         async with self.db.transaction() as conn:

@@ -17,7 +17,7 @@ from bot.clock import UTC
 from bot.counting.filter import ChannelResolver, ExclusionCache, MessageCounter, ancestry_from_cache, rejection_reason
 from bot.discord_ops import ChannelInfo, OpNetwork
 from bot.main import LeaderboardBot
-from tests.conftest import GUILD
+from tests.conftest import GUILD, install
 from tests.fakes import App, FakeDiscord, snowflake_at
 
 CATEGORY = 10
@@ -121,7 +121,8 @@ async def world() -> Any:
 
 
 @pytest.fixture
-def counter(app: App, fake: FakeDiscord) -> MessageCounter:
+async def counter(app: App, fake: FakeDiscord) -> MessageCounter:
+    await install(app, roles=False)  # counting starts at /setup (T0 = 2026-03-10 12:00)
     return app.services.counter
 
 
@@ -250,6 +251,7 @@ async def test_removing_exclusion_restores_counting(app: App, world: World, coun
 
 async def test_exclusions_survive_restart(config: Any, fake: FakeDiscord, clock: Any, world: World) -> None:
     first = await App.start(config, fake, clock)
+    await install(first, roles=False)
     await exclude(first, CATEGORY)
     await first.shutdown()
     second = await App.start(config, fake, clock)
@@ -327,7 +329,8 @@ async def test_concurrent_duplicate_handling_counts_once(app: App, world: World,
             await gate.wait()
             return await super().resolve(guild_id, channel)
 
-    counter = MessageCounter(app.services.exclusions, SlowResolver(fake), app.buffer)
+    await install(app, roles=False)
+    counter = MessageCounter(app.services.exclusions, SlowResolver(fake), app.buffer, app.services.installs)
     msg = world.message(world.text)
     msg.channel = world.client.get_partial_messageable(72, guild_id=GUILD)
     tasks = [asyncio.create_task(counter.handle(msg)) for _ in range(5)]
@@ -398,3 +401,24 @@ async def test_exclusion_cache_loads_from_db(app: App) -> None:
     await cache.load()
     assert set(cache.excluded_ids(GUILD)) == {5}
     assert set(cache.excluded_ids(999)) == set()
+
+
+async def test_messages_before_setup_are_not_counted(app: App, world: World, clock: Any) -> None:
+    """All-Time means since installation: nothing before /setup, and nothing earlier on the install day."""
+    early = world.message(world.text, created_at=datetime(2026, 3, 2, 10, tzinfo=UTC), seq=1)
+    assert not await app.services.counter.handle(early)  # guild not set up yet
+    await install(app, roles=False)  # installed_at = 2026-03-10 12:00
+    same_day_before = world.message(world.text, created_at=datetime(2026, 3, 10, 11, 59, 59, tzinfo=UTC), seq=2)
+    assert not await app.services.counter.handle(same_day_before)
+    after = world.message(world.text, created_at=datetime(2026, 3, 10, 12, 0, 1, tzinfo=UTC), seq=3)
+    assert await app.services.counter.handle(after)
+    assert await counted_total(app) == 1
+
+
+async def test_install_state_survives_restart(config: Any, fake: FakeDiscord, clock: Any, world: World) -> None:
+    first = await App.start(config, fake, clock)
+    await install(first, roles=False)
+    await first.shutdown()
+    second = await App.start(config, fake, clock)
+    assert await second.services.counter.handle(world.message(world.text, seq=4))
+    await second.shutdown()

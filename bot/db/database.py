@@ -15,7 +15,7 @@ import logging
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Awaitable
 
 import aiosqlite
 
@@ -118,11 +118,21 @@ class Database:
         if task is not None and self._owner is task:
             raise RuntimeError("Database lock is not re-entrant; nested transaction detected")
         await self._lock.acquire()
-        if self._conn is None:
+        conn = self._conn
+        if conn is None:
             self._lock.release()
             raise DatabaseError("Database is not connected")
         self._owner = task
-        return self._conn
+        if conn.in_transaction:
+            # Defence in depth: nobody holds the lock, so any open transaction is an
+            # orphan (e.g. left by an interrupted task). Never build on top of it.
+            log.error("Rolling back an orphaned SQLite transaction")
+            try:
+                await _run_to_completion(self._abort(conn))
+            except BaseException:
+                self._release()
+                raise
+        return conn
 
     def _release(self) -> None:
         self._owner = None
@@ -130,19 +140,21 @@ class Database:
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:
-        """Exclusive write transaction. Commits on success, rolls back on any exception."""
+        """Exclusive write transaction. Commits on success, rolls back on any exception.
+
+        Cancellation-safe: if the awaiting task is cancelled while BEGIN, a
+        statement or COMMIT is still queued on aiosqlite's worker thread, the
+        cleanup waits for the queue to drain and rolls back whatever is open
+        before the lock is released, so no transaction is ever orphaned.
+        """
         conn = await self._acquire()
         try:
-            await conn.execute("BEGIN IMMEDIATE")
             try:
+                await conn.execute("BEGIN IMMEDIATE")
                 yield conn
-            except BaseException:
-                await self._rollback(conn)
-                raise
-            try:
                 await conn.execute("COMMIT")
             except BaseException:
-                await self._rollback(conn)
+                await _run_to_completion(self._abort(conn))
                 raise
         finally:
             self._release()
@@ -157,9 +169,33 @@ class Database:
             self._release()
 
     @staticmethod
-    async def _rollback(conn: aiosqlite.Connection) -> None:
+    async def _abort(conn: aiosqlite.Connection) -> None:
+        """Return the connection to autocommit mode after an error or cancellation."""
         try:
+            # Statements run in order on the worker thread: this no-op waits for
+            # anything still queued (e.g. a BEGIN whose caller was cancelled).
+            await conn.execute("SELECT 1")
             if conn.in_transaction:
                 await conn.execute("ROLLBACK")
         except (sqlite3.Error, ValueError):  # pragma: no cover - connection already gone
             log.exception("ROLLBACK failed")
+
+
+async def _run_to_completion(coro: Awaitable[None]) -> None:
+    """Await ``coro`` to the end even if the caller is cancelled meanwhile.
+
+    The cancellation is re-raised afterwards; the caller's own exception handling
+    decides what happens next.
+    """
+    task = asyncio.ensure_future(coro)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                break
+            cancelled = True
+    task.result()
+    if cancelled:
+        raise asyncio.CancelledError()

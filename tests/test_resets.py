@@ -789,3 +789,29 @@ async def test_unique_constraint_prevents_duplicate_runs(app: App) -> None:
                 "created_at, updated_at) VALUES (?, 'daily', '2026-03-10', 'a', 'b', 'PENDING', 'x', 'x')",
                 (GUILD,),
             )
+
+
+async def test_role_switched_by_admin_mid_transition_unblocks(app: App, fake: FakeDiscord, clock: FakeClock) -> None:
+    """A run stuck on an unmanageable role follows /setrole instead of blocking later runs forever."""
+    await install(app)
+    await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 2)
+    fake.fail_next("add_role", OpForbidden("Missing Permissions", code=50013))  # role work started, then failed
+    clock.set(dt(2026, 3, 11, 0, 3))
+    await app.runner.tick()
+    run = await run_of(app, "daily", "2026-03-10")
+    assert run.status is RunStatus.ANNOUNCED and run.role_started_at is not None and run.role_id == ROLE_DAILY
+    fake.guilds[GUILD].roles[ROLE_DAILY].position = 150  # the old role is now unmanageable for good
+    new_role = 777
+    fake.create_role(GUILD, new_role, position=5)
+    await app.repo.set_reward_role(GUILD, "daily", new_role, clock.now())
+    clock.set(run.next_attempt_at + timedelta(seconds=1))
+    await app.runner.tick()
+    run = await run_of(app, "daily", "2026-03-10")
+    assert run.status is RunStatus.DONE and run.role_id == new_role
+    assert fake.holders_of(GUILD, new_role) == {11}
+    # The next day's run is not blocked.
+    await app.messages(GUILD, 12, dt(2026, 3, 11, 13), 3)
+    clock.set(dt(2026, 3, 12, 0, 3))
+    await app.runner.tick()
+    assert (await run_of(app, "daily", "2026-03-11")).status is RunStatus.DONE
+    assert fake.holders_of(GUILD, new_role) == {12}

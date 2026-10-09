@@ -171,3 +171,44 @@ async def test_large_snowflakes_and_hostile_strings_roundtrip(tmp_path: Path) ->
         assert rows[0].user_id == big and rows[0].milestone_id == big
     finally:
         await db.close()
+
+
+async def test_cancel_during_begin_never_orphans_a_transaction(tmp_path: Path) -> None:
+    """Regression: a task cancelled while BEGIN IMMEDIATE is queued must not leave it open."""
+    db = Database(tmp_path / "lb.db")
+    await db.connect()
+    repo = Repo(db)
+    try:
+        for _ in range(25):  # cancel at slightly different points each round
+            for delay in (0, 0, 1):
+                task = asyncio.create_task(repo.set_banner(GUILD, "https://cdn.example.com/x.png", T0))
+                for _ in range(delay + 1):
+                    await asyncio.sleep(0)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                await repo.apply_count_batch([CountDelta(GUILD, 11, "2026-03-10", 1, 1)], [])
+        rows = await repo.aggregate_counts(GUILD)
+        assert rows[0].total == 75  # every later write succeeded
+        async with db.read() as conn:
+            assert not conn.in_transaction
+    finally:
+        await db.close()
+
+
+async def test_orphaned_transaction_is_rolled_back_on_next_acquire(tmp_path: Path) -> None:
+    db = Database(tmp_path / "lb.db")
+    await db.connect()
+    repo = Repo(db)
+    try:
+        conn = db._conn
+        assert conn is not None
+        await conn.execute("BEGIN IMMEDIATE")  # simulate an orphan left behind by a bug
+        await conn.execute("INSERT INTO guild_config (guild_id, updated_at) VALUES (9, 'x')")
+        await repo.apply_count_batch([CountDelta(GUILD, 11, "2026-03-10", 1, 1)], [])
+        assert (await repo.aggregate_counts(GUILD))[0].total == 1
+        assert await repo.get_guild_config(9) is None  # the orphan's write was rolled back
+    finally:
+        await db.close()
