@@ -104,8 +104,8 @@ class BoardService:
             return
         if await self._repo.get_active_repost(guild_id) is not None:
             # The repost procedure owns the boards until it finishes.
-            await self.process_repost(guild_id)
-            return
+            if not await self.process_repost(guild_id):
+                return
         boards = await self._repo.get_board_messages(guild_id)
         if not boards or any(b.channel_id != cfg.board_channel_id for b in boards.values()):
             # No boards yet, or /setup moved the leaderboard channel (e.g. a crash

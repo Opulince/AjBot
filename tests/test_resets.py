@@ -815,3 +815,80 @@ async def test_role_switched_by_admin_mid_transition_unblocks(app: App, fake: Fa
     await app.runner.tick()
     assert (await run_of(app, "daily", "2026-03-11")).status is RunStatus.DONE
     assert fake.holders_of(GUILD, new_role) == {12}
+
+
+# ------------------------------------------------- randomized crash equivalence
+
+
+def _scenario(seed: int) -> tuple[list[tuple[int, datetime, int]], list[datetime]]:
+    """Random activity over ~3 weeks plus the moments the bot happens to be online."""
+    import random
+
+    rng = random.Random(seed)
+    messages = []
+    for day in range(21):
+        base = dt(2026, 3, 10, 13) + timedelta(days=day)
+        if rng.random() < 0.2:
+            continue  # an empty day
+        for user in rng.sample([11, 12, 13, 14, 15], rng.randint(1, 4)):
+            messages.append((user, base + timedelta(minutes=rng.randint(0, 600)), rng.randint(1, 6)))
+    ticks = []
+    moment = dt(2026, 3, 11, 0, 5)
+    while moment < dt(2026, 4, 1, 0, 5):
+        ticks.append(moment)
+        moment += timedelta(days=rng.choice([1, 1, 1, 2, 3]))  # sometimes offline across boundaries
+    ticks.append(dt(2026, 4, 1, 0, 5))
+    return messages, ticks
+
+
+async def _play(tmp_path: Path, seed: int, crash_rng: Any) -> dict[str, Any]:
+    config, fake, clock = build_world(tmp_path)
+    app = await App.start(config, fake, clock)
+    await install(app)
+    messages, ticks = _scenario(seed)
+    for user, at, n in messages:
+        await app.messages(GUILD, user, at, n)
+    crashes = 0
+    for moment in ticks:
+        clock.set(moment)
+        for _attempt in range(20):
+            if crash_rng is not None and crash_rng.random() < 0.6:
+                mode = crash_rng.choice(["after", "before"])
+                k = crash_rng.randint(1, 12)
+                (fake.crash_after_mutation if mode == "after" else fake.crash_before_mutation)(k)
+            app, crashed = await tick_with_crash(app, config, fake, clock)
+            fake.clear_injections()
+            if not crashed:
+                break
+            crashes += 1
+        await settle(app, clock, ticks=2, step=timedelta(seconds=30))
+    runs = {
+        (r.period_type.value, r.period_key): (r.winner_user_id, r.winner_count, r.status, r.announcement_message_id is not None)
+        for r in await app.repo.list_runs(GUILD)
+    }
+    state = {
+        "runs": runs,
+        "holders": {role: fake.holders_of(GUILD, role) for role in (ROLE_DAILY, ROLE_WEEKLY, ROLE_MONTHLY)},
+        "db_holders": {t: getattr(await app.repo.get_role_holder(GUILD, t), "user_id", None) for t in ("daily", "weekly", "monthly")},
+        "announcements": sorted(m.footer for m in fake.announcements(CHANNEL)),
+        "crashes": crashes,
+    }
+    await assert_converged(app, fake)
+    await app.shutdown()
+    return state
+
+
+@pytest.mark.parametrize("seed", range(10))
+async def test_randomized_crashes_reach_the_same_final_state(tmp_path: Path, seed: int) -> None:
+    import random
+
+    clean = await _play(tmp_path / "clean", seed, None)
+    crashed = await _play(tmp_path / "crashy", seed, random.Random(1000 + seed))
+    assert crashed["crashes"] > 0
+    for key in ("runs", "holders", "db_holders", "announcements"):
+        assert crashed[key] == clean[key], key
+    # Sanity: every role is held by exactly the latest eligible winner of its type.
+    for ptype, role in (("daily", ROLE_DAILY), ("weekly", ROLE_WEEKLY), ("monthly", ROLE_MONTHLY)):
+        winners = [v[0] for k, v in sorted(clean["runs"].items(), key=lambda kv: kv[0][1]) if k[0] == ptype and v[0] is not None]
+        expected = {winners[-1]} if winners else set()
+        assert clean["holders"][role] == expected, ptype
