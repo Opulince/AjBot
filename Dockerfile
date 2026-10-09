@@ -1,5 +1,8 @@
 # Small production image for the leaderboard bot.
-FROM python:3.12-slim
+# PYTHON_IMAGE can point at a registry mirror of the same official image, e.g.
+#   docker build --build-arg PYTHON_IMAGE=mirror.gcr.io/library/python:3.12-slim .
+ARG PYTHON_IMAGE=python:3.12-slim
+FROM ${PYTHON_IMAGE}
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

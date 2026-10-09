@@ -174,10 +174,10 @@ class CountBuffer:
             else:
                 live.count += failed.count
                 live.max_message_id = max(live.max_message_id, failed.max_message_id)
-        for key, meta in members.items():
-            live_meta = self._members.get(key)
+        for member_key, meta in members.items():
+            live_meta = self._members.get(member_key)
             if live_meta is None or meta.last_seen > live_meta.last_seen:
-                self._members[key] = meta
+                self._members[member_key] = meta
 
     def next_delay(self) -> float:
         """Delay before the next periodic flush: the interval, or bounded backoff after failures."""

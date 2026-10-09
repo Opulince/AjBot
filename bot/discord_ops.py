@@ -26,7 +26,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Awaitable, Callable, Iterator, Sequence, TypeVar
+from typing import Any, Awaitable, Callable, Iterator, Sequence, TypeVar
 
 import aiohttp
 import discord
@@ -442,7 +442,7 @@ class DiscordPyOps(DiscordOps):
             if channel is None:
                 channel = await guild.fetch_channel(channel_id)
             if isinstance(channel, discord.Thread):
-                parent = guild.get_channel(channel.parent_id)
+                parent: Any = guild.get_channel(channel.parent_id)
                 if parent is None:
                     parent = await guild.fetch_channel(channel.parent_id)
                 category_id = getattr(parent, "category_id", None)

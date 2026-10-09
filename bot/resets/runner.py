@@ -27,6 +27,7 @@ which board updates share):
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 from typing import Awaitable, Callable
 
@@ -220,7 +221,7 @@ class ResetRunner:
             before = run.status
             if run.status is RunStatus.COMPUTED:
                 public = await self._should_announce(run)
-                run = await self._step(lambda r: self._machine.announce(r, public=public), run)
+                run = await self._step(functools.partial(self._machine.announce, public=public), run)
             elif run.status is RunStatus.ANNOUNCED:
                 decision = await self._role_decision(run)
                 if decision == "wait":

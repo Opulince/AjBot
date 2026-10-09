@@ -159,6 +159,9 @@ def make_intents() -> discord.Intents:
 
 class LeaderboardBot(discord.Client):
     def __init__(self, config: Config, *, clock: Clock | None = None) -> None:
+        # No voice features are used; skip discord.py's "voice will NOT be supported" warnings.
+        discord.VoiceClient.warn_nacl = False
+        discord.VoiceClient.warn_dave = False
         super().__init__(
             intents=make_intents(),
             allowed_mentions=discord.AllowedMentions.none(),
@@ -334,6 +337,9 @@ def main() -> int:
         return asyncio.run(run_bot(config))
     except KeyboardInterrupt:  # pragma: no cover - signal handler normally wins
         return 0
+    except Exception:
+        log.exception("Fatal error; the bot stopped")
+        return 1
 
 
 if __name__ == "__main__":

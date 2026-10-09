@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -76,7 +77,7 @@ async def test_failed_migration_rolls_back(tmp_path: Path, monkeypatch: pytest.M
     ]
     monkeypatch.setattr(database_module, "MIGRATIONS", broken)
     monkeypatch.setattr(database_module, "LATEST_VERSION", LATEST_VERSION + 1)
-    with pytest.raises(Exception):
+    with pytest.raises(sqlite3.OperationalError):
         await Database(path).connect()
     monkeypatch.undo()
     db = Database(path)

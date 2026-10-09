@@ -197,7 +197,7 @@ class BoardMoreButton(ui.DynamicItem[ui.Button], template=MORE_TEMPLATE):
 
     @classmethod
     async def from_custom_id(
-        cls, interaction: discord.Interaction, item: ui.Button, match: re.Match[str], /
+        cls, interaction: discord.Interaction, item: ui.Item[Any], match: re.Match[str], /
     ) -> "BoardMoreButton":
         return cls(match["board"])
 
@@ -220,12 +220,13 @@ class PageButton(ui.DynamicItem[ui.Button], template=PAGE_TEMPLATE):
 
     @classmethod
     async def from_custom_id(
-        cls, interaction: discord.Interaction, item: ui.Button, match: re.Match[str], /
+        cls, interaction: discord.Interaction, item: ui.Item[Any], match: re.Match[str], /
     ) -> "PageButton":
         # Out-of-range pages are clamped when rendering instead of raising, so a
         # tampered or stale custom ID still gets a sensible answer.
         page = int(match["page"])
-        return cls(match["board"], page, label=item.label or "Page", disabled=False)
+        label = getattr(item, "label", None) or "Page"
+        return cls(match["board"], page, label=label, disabled=False)
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await handle_page(interaction, self.board_type, self.page)
