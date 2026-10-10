@@ -44,14 +44,15 @@ from bot.discord_ops import (
 )
 from bot.periods import ALLTIME, BOARD_ORDER, PeriodType, next_reset
 from bot.ranking import Ranker
-from bot.ui.embeds import TOP_SHOWN, PreviousWinner, board_marker, build_board_embed
+from bot.ui.embeds import TOP_SHOWN, PreviousWinner, board_marker, build_board_embed, parse_board_marker
 from bot.ui.views import board_view
 
 log = logging.getLogger(__name__)
 
 REPOST_SCAN_MARGIN = timedelta(minutes=15)
-REPOST_SCAN_LIMIT = 200
-SINGLE_SCAN_LIMIT = 50
+REPOST_SCAN_LIMIT = 1000  # paged by discord.py, 100 messages per request
+SINGLE_SCAN_LIMIT = 100
+SWEEP_LIMIT = 200
 MAX_DELETE_ATTEMPTS = 5
 AUDIT_TTL = timedelta(hours=6)
 
@@ -190,14 +191,56 @@ class BoardService:
                 await self._repo.set_board_message(guild_id, board_type, channel_id, msg.id, generation)
                 log.info("Adopted existing board %s message %s in guild %s", board_type, msg.id, guild_id)
                 return
-        embed = await self.render(guild_id, board_type, generation, cfg)
         try:
-            message_id = await self._ops.send_message(channel_id, embed=embed, view=board_view(board_type))
+            message_id = await self._send_board(guild_id, board_type, generation, cfg, channel_id)
         except OpError as exc:
             log.error("Could not recreate board %s in guild %s: %s", board_type, guild_id, exc.describe())
             return
         await self._repo.set_board_message(guild_id, board_type, channel_id, message_id, generation)
         log.info("Recreated board %s as message %s in guild %s", board_type, message_id, guild_id)
+        tracked = {b.message_id for b in (await self._repo.get_board_messages(guild_id)).values()}
+        await self._sweep_strays(guild_id, channel_id, keep=tracked, max_generation=generation)
+
+    async def _send_board(
+        self, guild_id: int, board_type: str, generation: int, cfg: GuildConfig, channel_id: int
+    ) -> int:
+        """Post one board; if Discord rejects the banner image, post it without the banner."""
+        embed = await self.render(guild_id, board_type, generation, cfg)
+        try:
+            return await self._ops.send_message(channel_id, embed=embed, view=board_view(board_type))
+        except OpBadRequest:
+            if not cfg.banner_url:
+                raise
+            log.error("Board %s rejected with banner in guild %s; sending without it", board_type, guild_id)
+        embed = await self.render(guild_id, board_type, generation, cfg, with_banner=False)
+        return await self._ops.send_message(channel_id, embed=embed, view=board_view(board_type))
+
+    async def _sweep_strays(self, guild_id: int, channel_id: int, *, keep: set[int], max_generation: int) -> None:
+        """Delete untracked bot board messages of this guild (same or older generation).
+
+        Strays come from missed adoption scans (very busy channels) or from a
+        message created twice by a transport-level retry. Best effort: a failed
+        scan or delete is logged and retried on a later repost/recreation.
+        """
+        try:
+            history = await self._ops.recent_history(channel_id, after=None, limit=SWEEP_LIMIT)
+        except OpError as exc:
+            log.warning("Stray-board sweep skipped in guild %s: %s", guild_id, exc.describe())
+            return
+        bot_id = self._ops.bot_user_id
+        for msg in history:
+            if msg.author_id != bot_id or msg.id in keep:
+                continue
+            parsed = next((m for m in map(parse_board_marker, (*msg.footers, msg.content)) if m), None)
+            if parsed is None or parsed[0] != guild_id or parsed[2] > max_generation:
+                continue
+            try:
+                await self._ops.delete_message(channel_id, msg.id)
+                log.info("Deleted stray %s board message %s (generation %s) in guild %s", parsed[1], msg.id, parsed[2], guild_id)
+            except OpNotFound:
+                pass
+            except OpError as exc:
+                log.warning("Could not delete stray board message %s in guild %s: %s", msg.id, guild_id, exc.describe())
 
     async def _audit_members(self, guild_id: int) -> None:
         """Refresh the "(left)" state of users shown in the top 10s (rate-limited by a TTL).
@@ -358,22 +401,8 @@ class BoardService:
                         )
                         break
             for board_type in [t for t in BOARD_ORDER if t not in op.new_ids]:
-                embed = await self.render(op.guild_id, board_type, op.generation, cfg)
                 try:
-                    message_id = await self._ops.send_message(op.channel_id, embed=embed, view=board_view(board_type))
-                except OpBadRequest as exc:
-                    if not cfg.banner_url:
-                        await self._fail_repost(op, f"send {board_type}", exc)
-                        return None
-                    log.error("Board %s rejected with banner in guild %s; sending without it", board_type, op.guild_id)
-                    embed = await self.render(op.guild_id, board_type, op.generation, cfg, with_banner=False)
-                    try:
-                        message_id = await self._ops.send_message(
-                            op.channel_id, embed=embed, view=board_view(board_type)
-                        )
-                    except OpError as exc2:
-                        await self._fail_repost(op, f"send {board_type}", exc2)
-                        return None
+                    message_id = await self._send_board(op.guild_id, board_type, op.generation, cfg, op.channel_id)
                 except OpError as exc:
                     await self._fail_repost(op, f"send {board_type}", exc)
                     return None
@@ -407,6 +436,7 @@ class BoardService:
             except OpError as exc:
                 await self._fail_repost(op, f"delete old {board_type}", exc)
                 return False
+        await self._sweep_strays(op.guild_id, op.channel_id, keep=new_ids, max_generation=op.generation)
         await self._repo.repost_complete(op.guild_id, op.generation, self._clock.now(), "; ".join(notes) or None)
         log.info("Board repost guild=%s generation=%s complete", op.guild_id, op.generation)
         return True

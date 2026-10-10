@@ -132,6 +132,8 @@ class FakeDiscord(DiscordOps):
         self._crash_before_any: int | None = None
         self._seq = itertools.count(1)
         self.on_call: Callable[[str], Any] | None = None
+        self.duplicate_next_send = False  # simulate a create that a transport retry repeated
+        self.forbidden_history: set[int] = set()
 
     # ------------------------------------------------------------ fixtures
 
@@ -156,6 +158,12 @@ class FakeDiscord(DiscordOps):
 
     def add_channel(self, channel_id: int) -> None:
         self.channels.setdefault(channel_id, [])
+
+    def add_user_message(self, channel_id: int, author_id: int = 4242, content: str = "chat") -> int:
+        """A normal member's message in a channel (e.g. chatter in the board channel)."""
+        msg = FakeMessage(self._new_id(), channel_id, author_id, content, None, [], self.clock.now())
+        self.channels[channel_id].append(msg)
+        return msg.id
 
     def roles_of(self, guild_id: int, user_id: int) -> set[int]:
         member = self.guilds[guild_id].members.get(user_id)
@@ -268,16 +276,19 @@ class FakeDiscord(DiscordOps):
         self._before("send_message", channel_id)
         if channel_id not in self.channels:
             raise OpNotFound("Unknown Channel", code=10003)
-        msg = FakeMessage(
-            id=self._new_id(),
-            channel_id=channel_id,
-            author_id=self._bot_id,
-            content=content or "",
-            embed=embed.to_dict() if embed is not None else None,
-            components=_custom_ids(view),
-            created_at=self.clock.now(),
-        )
-        self.channels[channel_id].append(msg)
+        copies = 2 if self.duplicate_next_send else 1
+        self.duplicate_next_send = False
+        for _ in range(copies):
+            msg = FakeMessage(
+                id=self._new_id(),
+                channel_id=channel_id,
+                author_id=self._bot_id,
+                content=content or "",
+                embed=embed.to_dict() if embed is not None else None,
+                components=_custom_ids(view),
+                created_at=self.clock.now(),
+            )
+            self.channels[channel_id].append(msg)
         self._after("send_message")
         return msg.id
 
@@ -312,6 +323,8 @@ class FakeDiscord(DiscordOps):
         self._before("history", channel_id)
         if channel_id not in self.channels:
             raise OpNotFound("Unknown Channel", code=10003)
+        if channel_id in self.forbidden_history:
+            raise OpForbidden("403 Forbidden (error code: 50001): Missing Access", code=50001)
         msgs = self.channels[channel_id]
         if after is not None:
             selected = [m for m in msgs if m.created_at > ensure_utc(after)][:limit]

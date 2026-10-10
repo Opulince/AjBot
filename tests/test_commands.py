@@ -242,3 +242,29 @@ async def test_setup_hook_initialises_database_items_commands_and_tasks(
     assert not bot.db.connected
     assert all(t.done() for t in tasks)  # type: ignore[union-attr]
     assert all(t.cancelled() or t.exception() is None for t in tasks)  # type: ignore[union-attr]
+
+
+async def test_messages_are_sent_with_an_enforced_nonce() -> None:
+    """Discord dedupes discord.py's internal 5xx retries when a nonce is enforced."""
+    from bot.discord_ops import DiscordPyOps
+
+    class Capture(discord.abc.Messageable):
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def _get_channel(self) -> Any:
+            return self
+
+        async def send(self, **kwargs: Any) -> Any:  # type: ignore[override]
+            self.calls.append(kwargs)
+            return SimpleNamespace(id=42)
+
+    channel = Capture()
+    ops = DiscordPyOps(SimpleNamespace(get_channel=lambda _cid: channel))  # type: ignore[arg-type]
+    assert await ops.send_message(5, content="a") == 42
+    await ops.send_message(5, content="b")
+    nonces = [c["nonce"] for c in channel.calls]
+    assert all(isinstance(n, int) and 0 <= n < 2**63 and len(str(n)) <= 25 for n in nonces)
+    assert nonces[0] != nonces[1]
+    params = discord.http.handle_message_parameters(content="a", nonce=nonces[0])
+    assert params.payload["enforce_nonce"] is True and params.payload["nonce"] == str(nonces[0])

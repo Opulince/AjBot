@@ -892,3 +892,114 @@ async def test_randomized_crashes_reach_the_same_final_state(tmp_path: Path, see
         winners = [v[0] for k, v in sorted(clean["runs"].items(), key=lambda kv: kv[0][1]) if k[0] == ptype and v[0] is not None]
         expected = {winners[-1]} if winners else set()
         assert clean["holders"][role] == expected, ptype
+
+
+# ------------------------------------------------ announcement recovery hardening
+
+
+async def test_busy_channel_announcement_crash_is_adopted(tmp_path: Path) -> None:
+    config, fake, clock = build_world(tmp_path)
+    app = await App.start(config, fake, clock)
+    await install(app)
+    await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 3)
+    clock.set(dt(2026, 3, 10, 23, 50))
+    for _ in range(300):  # heavy chatter in the board channel right before the reset
+        fake.add_user_message(CHANNEL)
+        clock.advance(seconds=2)
+    clock.set(dt(2026, 3, 11, 0, 3))
+    fake.crash_after("send_message", 1)
+    app, crashed = await tick_with_crash(app, config, fake, clock)
+    assert crashed
+    await settle(app, clock)
+    assert len(fake.announcements(CHANNEL)) == 1
+    assert (await run_of(app, "daily", "2026-03-10")).announcement_message_id == fake.announcements(CHANNEL)[0].id
+    await app.shutdown()
+
+
+async def test_recovery_window_follows_the_latest_send_attempt(tmp_path: Path) -> None:
+    """A failed first send must not anchor the scan window hours before a later successful one."""
+    config, fake, clock = build_world(tmp_path)
+    app = await App.start(config, fake, clock)
+    await install(app)
+    await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 3)
+    clock.set(dt(2026, 3, 11, 0, 3))
+    fake.fail_next("send_message", OpForbidden("Missing Permissions", code=50013))
+    await app.runner.tick()
+    run = await run_of(app, "daily", "2026-03-10")
+    assert run.status is RunStatus.COMPUTED and run.announce_started_at == dt(2026, 3, 11, 0, 3)
+    for _ in range(1200):  # chat keeps flowing while the permission is broken
+        fake.add_user_message(CHANNEL)
+        clock.advance(seconds=5)
+    clock.set(max(clock.now(), run.next_attempt_at) + timedelta(seconds=1))
+    fake.crash_after("send_message", 1)  # the retry posts, then the process dies
+    app, crashed = await tick_with_crash(app, config, fake, clock)
+    assert crashed
+    await settle(app, clock)
+    assert len(fake.announcements(CHANNEL)) == 1
+    await app.shutdown()
+
+
+async def test_unreadable_old_channel_does_not_block_moved_announcement(app: App, fake: FakeDiscord, clock: FakeClock) -> None:
+    from bot.commands.admin import setup_guild
+
+    await install(app)
+    await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 3)
+    clock.set(dt(2026, 3, 11, 0, 3))
+    fake.fail_next("send_message", OpForbidden("Missing Access", code=50001))
+    await app.runner.tick()
+    run = await run_of(app, "daily", "2026-03-10")
+    assert run.status is RunStatus.COMPUTED and run.announcement_channel_id == CHANNEL
+    fake.forbidden_history.add(CHANNEL)  # the bot can no longer read the old channel
+    fake.add_channel(200)
+    await setup_guild(app.services, GUILD, 200)  # the admin moves the leaderboard
+    clock.set(run.next_attempt_at + timedelta(seconds=1))
+    await app.runner.tick()
+    run = await run_of(app, "daily", "2026-03-10")
+    assert run.status is RunStatus.DONE and run.announcement_channel_id == 200
+    assert len(fake.announcements(200)) == 1
+    assert fake.holders_of(GUILD, ROLE_DAILY) == {11}
+
+
+async def test_unreadable_old_channel_does_not_block_silent_catch_up(app: App, fake: FakeDiscord, clock: FakeClock) -> None:
+    await install(app)
+    await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 3)
+    clock.set(dt(2026, 3, 11, 0, 3))
+    fake.fail_next("send_message", OpForbidden("Missing Access", code=50001))
+    await app.runner.tick()
+    fake.forbidden_history.add(CHANNEL)
+    clock.set(dt(2026, 3, 12, 0, 5))  # Mar 11 is empty; Mar 10 is now historical
+    await app.runner.tick()
+    run = await run_of(app, "daily", "2026-03-10")
+    assert run.status is RunStatus.DONE and run.announcement_message_id is None  # recorded silently
+    assert fake.holders_of(GUILD, ROLE_DAILY) == {11}  # still the latest eligible winner
+
+
+async def test_stale_forced_test_run_is_closed_without_a_winner(app: App, fake: FakeDiscord, clock: FakeClock) -> None:
+    from bot.commands.admin import describe_forced_run
+
+    await install(app)
+    await app.messages(GUILD, 11, dt(2026, 3, 10, 12, 30), 3)
+    clock.set(dt(2026, 3, 10, 13))
+    fake.fail_next("fetch_member", OpNetwork("timeout"), OpNetwork("timeout"), OpNetwork("timeout"))
+    run = await app.runner.force_reset(GUILD, "daily")
+    assert run.status is RunStatus.PENDING
+    await app.messages(GUILD, 12, dt(2026, 3, 10, 13, 2), 10)  # after the test period ended
+    clock.set(dt(2026, 3, 10, 13, 5))
+    await app.runner.tick()
+    run = await app.repo.get_run(run.id)
+    assert run is not None and run.status is RunStatus.SKIPPED_EMPTY and run.winner_user_id is None
+    assert "stale" in (run.last_error or "")
+    assert fake.announcements(CHANNEL) == [] and fake.holders_of(GUILD, ROLE_DAILY) == set()
+    assert "stale" in describe_forced_run(run).lower()
+
+
+async def test_prompt_forced_test_run_with_zero_grace_is_not_stale(tmp_path: Path) -> None:
+    config, fake, clock = build_world(tmp_path)
+    config = make_config(tmp_path, reset_grace_seconds=0)
+    app = await App.start(config, fake, clock)
+    await install(app)
+    await app.messages(GUILD, 11, dt(2026, 3, 10, 12, 30), 2)
+    clock.set(dt(2026, 3, 10, 13))
+    run = await app.runner.force_reset(GUILD, "weekly")
+    assert run.status is RunStatus.DONE and run.winner_user_id == 11
+    await app.shutdown()

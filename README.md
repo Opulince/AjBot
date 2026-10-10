@@ -348,11 +348,16 @@ with the exact period boundaries stored. It moves through
   interrupted is always finished first, never skipped.
 - One board repost happens after all catch-up announcements.
 
+**Duplicate-safe sends.** Every message is created with a random nonce that Discord enforces. If
+discord.py internally retries a request after a lost response (5xx or connection reset), Discord
+returns the message it already created instead of making a second one.
+
 **Board reposts.** New boards are posted with a fresh generation marker `board:{guild}:{type}:{gen}`
 in the footer, and each new message ID is saved immediately. After a crash, the channel is scanned for
 that generation's markers and any found are adopted. Old boards are deleted only after all four
-replacements exist, so the channel always has at least one working set of boards, and a rerun
-converges to exactly four.
+replacements exist, so the channel always has at least one working set of boards. Before finishing,
+untracked bot board messages from the same or older generations are deleted, so a rerun converges to
+exactly four.
 
 **Persistent buttons.** The buttons are `DynamicItem`s matched by custom ID (`lb:more:{board}`,
 `lb:pg:{board}:{page}`) and registered at startup, so buttons on old messages keep working after
@@ -383,13 +388,16 @@ restarts.
   because it might be a role used for other things. Remove it manually if needed.
 - **A recreated board lands at the bottom.** When a single board message is deleted by hand, only that
   board is reposted, below the others. The next reset announcement restores the normal order.
-- **Recovery scans are bounded:** up to 200 messages after a repost started, 100 after an announcement
-  attempt. In a very busy channel, a crash could leave one duplicate message. Use a dedicated,
+- **Recovery scans are bounded.** They read up to 1,000 messages after a repost or announcement attempt
+  started. Untracked duplicate boards are also swept from the newest 200 messages when a repost finishes.
+  In an extremely busy channel a crash could still leave one duplicate message. Use a dedicated,
   read-only leaderboard channel.
 - **Ephemeral "Show 11–100" pages** only work while Discord still shows the ephemeral message. Clicks on
   expired pages are ignored gracefully.
 - **`/forcereset` is not a dry run.** It posts a `[TEST]` announcement and moves the real reward role.
-  Use a private test server for experiments.
+  Use a private test server for experiments. A test run that cannot be computed within a few minutes
+  (for example because Discord is unreachable) is closed without a winner, because the day's counts
+  would by then include messages sent after the test period.
 - **One process per database.** SQLite and the in-memory buffer assume exactly one running instance.
 - **All times are UTC.** Boundaries are not configurable per time zone.
 

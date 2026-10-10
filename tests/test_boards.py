@@ -338,14 +338,23 @@ async def test_only_one_active_repost(app: App) -> None:
 
 async def test_forbidden_delete_gives_up_after_bounded_attempts(app: App, fake: FakeDiscord) -> None:
     await install(app)
+    old = await assert_four_boards(app, fake)
+    undeletable = old["alltime"]
+    real_delete = fake.delete_message
+
+    async def delete(channel_id: int, message_id: int) -> None:
+        if message_id == undeletable:  # e.g. the bot lost access to that message
+            raise OpForbidden("Missing Access")
+        await real_delete(channel_id, message_id)
+
+    fake.delete_message = delete  # type: ignore[method-assign]
     await _start_repost(app)
     for _ in range(4):
-        fake.fail_next("delete_message", OpForbidden("Missing Access"))
-        assert not await _process(app)
-    fake.fail_next("delete_message", OpForbidden("Missing Access"))
+        assert not await _process(app)  # retried a bounded number of times
     assert await _process(app)  # fifth attempt: give up on that message, finish the rest
     assert await app.repo.get_active_repost(GUILD) is None
-    assert len(fake.board_messages(CHANNEL)) == 5  # one undeletable old board remains
+    remaining = fake.board_messages(CHANNEL)
+    assert len(remaining) == 5 and undeletable in {m.id for m in remaining}  # sweep could not remove it either
     boards = await app.repo.get_board_messages(GUILD)
     assert all(b.generation == 2 for b in boards.values())
 
@@ -392,3 +401,65 @@ async def test_audit_uses_observation_time_for_departures(app: App, fake: FakeDi
     await update(app)
     member = await app.repo.get_member(GUILD, 13)
     assert member is not None and member.left_at is not None
+
+
+# ------------------------------------------------- strays, busy channels, banner
+
+
+async def test_transport_level_duplicate_board_is_swept(app: App, fake: FakeDiscord) -> None:
+    """discord.py re-POSTs on 5xx; if the first create succeeded, the untracked copy is removed."""
+    await install(app)
+    await _start_repost(app)
+    fake.duplicate_next_send = True  # the daily board gets created twice
+    assert await _process(app)
+    await assert_four_boards(app, fake)
+
+
+async def test_busy_channel_orphan_is_not_left_behind(tmp_path: Path) -> None:
+    config, fake, clock = world(tmp_path)
+    app = await App.start(config, fake, clock)
+    await install(app)
+    clock.advance(minutes=20)
+    for _ in range(250):  # lots of chat right before the repost starts
+        fake.add_user_message(CHANNEL)
+        clock.advance(seconds=2)
+    await _start_repost(app)
+    fake.crash_after("send_message", 3)  # monthly posted, never recorded
+    with pytest.raises(SimulatedCrash):
+        await _process(app)
+    await app.crash()
+    fake.clear_injections()
+    app = await App.start(config, fake, clock)
+    assert await _process(app)
+    await assert_four_boards(app, fake)
+    await app.shutdown()
+
+
+async def test_single_recreation_falls_back_without_rejected_banner(app: App, fake: FakeDiscord) -> None:
+    await install(app)
+    await app.repo.set_banner(GUILD, "https://cdn.example.com/broken.png", app.services.clock.now())
+    ids = await assert_four_boards(app, fake)
+    fake.channels[CHANNEL] = [m for m in fake.channels[CHANNEL] if m.id != ids["weekly"]]
+    fake.fail_next("send_message", OpBadRequest("Invalid Form Body: embeds.0.image.url"))
+    await update(app)
+    new_ids = await assert_four_boards(app, fake)
+    weekly = next(m for m in fake.board_messages(CHANNEL) if m.id == new_ids["weekly"])
+    assert "image" not in weekly.embed
+
+
+async def test_single_recreation_sweeps_duplicate(app: App, fake: FakeDiscord) -> None:
+    await install(app)
+    ids = await assert_four_boards(app, fake)
+    fake.channels[CHANNEL] = [m for m in fake.channels[CHANNEL] if m.id != ids["daily"]]
+    fake.duplicate_next_send = True
+    await update(app)
+    await assert_four_boards(app, fake)
+
+
+async def test_sweep_never_touches_other_users_or_tracked_boards(app: App, fake: FakeDiscord) -> None:
+    await install(app)
+    chat = fake.add_user_message(CHANNEL, content="board:1:daily:1 looks nice")  # a human quoting a marker
+    await _start_repost(app)
+    assert await _process(app)
+    await assert_four_boards(app, fake)
+    assert any(m.id == chat for m in fake.messages(CHANNEL))

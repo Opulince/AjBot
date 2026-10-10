@@ -21,6 +21,7 @@ import asyncio
 import logging
 import random
 import re
+import secrets
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -363,7 +364,10 @@ class DiscordPyOps(DiscordOps):
             replied_user=False,
             users=[discord.Object(id=u) for u in mention_user_ids] if mention_user_ids else False,
         )
-        kwargs: dict = {"allowed_mentions": allowed}
+        # discord.py retries 5xx / connection resets internally with the same
+        # payload; a nonce makes Discord return the already-created message
+        # (enforce_nonce) instead of creating a duplicate.
+        kwargs: dict = {"allowed_mentions": allowed, "nonce": secrets.randbits(63)}
         if content is not None:
             kwargs["content"] = content
         if embed is not None:
