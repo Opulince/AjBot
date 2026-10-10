@@ -47,6 +47,7 @@ class Database:
         self._conn: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
         self._owner: asyncio.Task | None = None
+        self._closed = False
 
     @property
     def connected(self) -> bool:
@@ -54,6 +55,8 @@ class Database:
 
     async def connect(self) -> None:
         """Open the database, apply pragmas and run pending migrations."""
+        if self._closed:
+            raise DatabaseError("Database was closed (shutdown in progress); refusing to reopen")
         if self._conn is not None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -73,10 +76,16 @@ class Database:
         except BaseException:
             await conn.close()
             raise
+        if self._closed:
+            # close() ran while we were opening (a shutdown signal raced startup):
+            # never leave a live connection (and its worker thread) behind.
+            await conn.close()
+            raise DatabaseError("Shutdown requested while the database was opening")
         self._conn = conn
         log.info("Database ready at %s (schema version %d, journal_mode=%s)", self.path, LATEST_VERSION, mode)
 
     async def close(self) -> None:
+        self._closed = True
         if self._conn is None:
             return
         async with self._lock:

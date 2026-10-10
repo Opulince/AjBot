@@ -122,6 +122,24 @@ async def set_banner(services: "Services", guild_id: int, url: str | None) -> No
         await services.boards.update_guild(guild_id)
 
 
+def format_exclusion_list(lines: list[str], purged: int = 0, limit: int = 1900) -> str:
+    """Whole-line list that never silently drops entries (Discord caps messages at 2000 chars)."""
+    header = "Excluded:" if lines else "No channels or categories are excluded."
+    shown: list[str] = []
+    length = len(header)
+    for i, line in enumerate(lines):
+        remaining = len(lines) - i
+        if length + len(line) + 1 > limit - 40:  # keep room for the "more" marker
+            shown.append(f"…and {remaining} more not shown")
+            break
+        shown.append(line)
+        length += len(line) + 1
+    text = "\n".join([header, *shown])
+    if purged:
+        text += f"\nRemoved {purged} exclusion(s) for channels that no longer exist."
+    return text
+
+
 def describe_forced_run(run: ResetRun) -> str:
     head = f"Forced **test** reset `{run.period_key}` ({run.period_type.value}) — state **{run.status.value}**."
     if run.status is RunStatus.SKIPPED_EMPTY:
@@ -221,17 +239,21 @@ def register_admin_commands(tree: app_commands.CommandTree, services: "Services"
             await _reply(interaction, "No channels or categories are excluded.")
             return
         guild = interaction.guild
-        lines = []
+        assert guild is not None
+        lines: list[str] = []
+        purged = 0
         for channel_id in ids:
-            channel = guild.get_channel(channel_id) if guild else None
+            channel = guild.get_channel(channel_id)
             if channel is None:
-                lines.append(f"• `{channel_id}` (deleted or unknown channel)")
+                # The channel or category was deleted (IDs are never reused): drop the
+                # stale row, since a deleted channel can no longer be picked to remove it.
+                await exclude_remove(services, guild.id, channel_id)
+                purged += 1
             elif isinstance(channel, discord.CategoryChannel):
                 lines.append(f"• Category **{discord.utils.escape_markdown(channel.name)}** (`{channel_id}`)")
             else:
                 lines.append(f"• {channel.mention} (`{channel_id}`)")
-        text = "Excluded:\n" + "\n".join(lines)
-        await _reply(interaction, text[:1990])
+        await _reply(interaction, format_exclusion_list(lines, purged))
 
     tree.add_command(exclude)
 

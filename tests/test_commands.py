@@ -268,3 +268,17 @@ async def test_messages_are_sent_with_an_enforced_nonce() -> None:
     assert nonces[0] != nonces[1]
     params = discord.http.handle_message_parameters(content="a", nonce=nonces[0])
     assert params.payload["enforce_nonce"] is True and params.payload["nonce"] == str(nonces[0])
+
+
+def test_exclusion_list_never_silently_drops_entries() -> None:
+    from bot.commands.admin import format_exclusion_list
+
+    lines = [f"• <#{100000000000000000 + i}> (`{100000000000000000 + i}`)" for i in range(120)]
+    text = format_exclusion_list(lines, purged=2)
+    assert len(text) < 2000
+    shown = [line for line in text.splitlines() if line.startswith("•")]
+    assert all(line in lines for line in shown)  # whole lines only, never cut mid-mention
+    assert f"…and {120 - len(shown)} more not shown" in text
+    assert "Removed 2 exclusion(s)" in text
+    assert format_exclusion_list(lines[:3]) == "Excluded:\n" + "\n".join(lines[:3])
+    assert format_exclusion_list([], purged=1).startswith("No channels or categories are excluded.")

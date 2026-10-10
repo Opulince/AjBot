@@ -13,7 +13,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Unprivileged runtime user; /data is the persistent volume (database + logs).
+# Unprivileged runtime user (the entrypoint drops to it); /data is the
+# persistent volume holding the database and logs.
 RUN useradd --create-home --uid 10001 bot \
     && mkdir -p /data \
     && chown bot:bot /data
@@ -22,11 +23,14 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY bot ./bot
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-USER bot
 VOLUME ["/data"]
 
-# The bot handles SIGTERM: it stops its tasks, flushes buffered counts and
-# closes the database. Give it time with `docker run --stop-timeout 30`.
+# The entrypoint fixes /data ownership (root-owned provider volumes) and then
+# runs the bot as the unprivileged "bot" user via setpriv. The bot handles
+# SIGTERM: it stops its tasks, flushes buffered counts and closes the database.
+# Give it time with `docker run --stop-timeout 30`.
 STOPSIGNAL SIGTERM
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["python", "-m", "bot.main"]
