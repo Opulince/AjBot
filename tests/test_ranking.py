@@ -19,7 +19,7 @@ import pytest
 from bot.clock import UTC
 from bot.commands.stats import user_standings
 from bot.periods import period_containing
-from bot.ranking import Ranker, milestone_ms, rank_rows, sort_key
+from bot.ranking import milestone_ms, rank_rows, sort_key
 from bot.db.repo import AggregateRow
 from bot.ui.embeds import build_board_embed
 from tests.conftest import GUILD, install
