@@ -212,3 +212,23 @@ async def test_orphaned_transaction_is_rolled_back_on_next_acquire(tmp_path: Pat
         assert await repo.get_guild_config(9) is None  # the orphan's write was rolled back
     finally:
         await db.close()
+
+
+async def test_close_before_connect_finishes_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: close() during connect() must not leave a live connection behind."""
+    db = Database(tmp_path / "lb.db")
+    original = Database._migrate
+
+    async def slow_migrate(self: Database, conn: object) -> None:
+        await asyncio.sleep(0.2)
+        await original(self, conn)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Database, "_migrate", slow_migrate)
+    connecting = asyncio.create_task(db.connect())
+    await asyncio.sleep(0.05)
+    await db.close()
+    with pytest.raises(DatabaseError, match="Shutdown requested"):
+        await connecting
+    assert not db.connected
+    with pytest.raises(DatabaseError, match="closed"):
+        await db.connect()

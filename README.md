@@ -158,10 +158,11 @@ cp .env.example .env
 | `RESET_GRACE_SECONDS` | no | `120` | Wait after each boundary before computing the winner, so late events can still land (0–3600). |
 | `BOARD_UPDATE_SECONDS` | no | `300` | How often the boards are edited (60–86400). |
 | `LOG_DIR` | no | `logs` | Directory for the rotating log file `leaderboard.log`. |
-| `LOG_LEVEL` | no | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
+| `LOG_LEVEL` | no | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`. Applies to discord.py's own log lines too. |
 
 Configuration is validated at startup. Any missing or invalid value stops the bot immediately with
-a message listing every problem (exit code 2).
+a message listing every problem (exit code 2). This includes storage: the database and log
+directories are created and checked for write access before anything else happens.
 
 **Database location.** The default is `data/leaderboard.db` relative to the working directory.
 Docker sets `DB_PATH=/data/leaderboard.db` (the `/data` volume). The systemd unit uses
@@ -200,8 +201,12 @@ docker run -d --name leaderboard-bot \
 - `/data` holds the database and logs. Keep it on a persistent volume.
 - `--restart unless-stopped` restarts the bot after crashes and host reboots.
 - `--stop-timeout 30` gives the graceful shutdown (final flush) time to finish. The default is only 10s.
-- If you bind-mount a host directory instead of using a named volume, make it writable by UID 10001,
-  for example `sudo chown 10001:10001 /srv/leaderboard`.
+- **Volume ownership is handled for you.** The container starts as root only long enough for its
+  entrypoint to take ownership of `/data`. That covers root-owned provider volumes and bind mounts.
+  It then runs the bot as the unprivileged `bot` user (UID 10001).
+- If your platform forces a non-root user (for example `--user` or OpenShift), the volume must already be
+  writable by that user. Otherwise the bot exits with a clear "Storage is not usable" error (exit code 2)
+  instead of crash-looping.
 
 Docker Compose equivalent:
 
@@ -219,8 +224,12 @@ volumes:
 ```
 
 Most hosting providers that run a Dockerfile can use the image as is: set `DISCORD_TOKEN` in their
-environment settings and attach a persistent volume at `/data`, or point `DB_PATH` at wherever their
-volume is mounted.
+environment settings and attach a persistent volume at `/data`. If their volume is mounted somewhere
+else, set both `DB_PATH` and `LOG_DIR` inside it. The automatic ownership fix only covers `/data`, so
+that location must be writable by UID 10001.
+
+If Docker Hub rate-limits your builds, build from a mirror of the same official image:
+`docker build --build-arg PYTHON_IMAGE=mirror.gcr.io/library/python:3.12-slim .`
 
 ## Running under systemd
 
@@ -281,7 +290,7 @@ All administrative commands require **Manage Server**. They are hidden from memb
 | `/setup channel:<text channel>` | Sets the leaderboard channel and creates the four boards if they don't exist. The first run records the installation time, which is never changed afterwards. Safe to rerun: existing boards are reused, and changing the channel moves the boards there. |
 | `/exclude add target:<channel or category>` | Stops counting messages there, including in its threads and forum posts. |
 | `/exclude remove target:<channel or category>` | Starts counting there again. |
-| `/exclude list` | Lists the exclusions. |
+| `/exclude list` | Lists the exclusions. Exclusions of channels that have since been deleted are cleaned up automatically. |
 | `/setrole period:<daily\|weekly\|monthly> role:<role>` | Sets that period's reward role. Rejects `@everyone` and integration-managed roles, and warns if the bot can't manage the role (hierarchy or permissions). |
 | `/setbanner set url:<https url>` | Sets the banner image. Only `https://` URLs on public hosts are accepted. The URL is never fetched by the bot. |
 | `/setbanner clear` | Removes the banner. |
@@ -303,7 +312,7 @@ log record as a second layer of protection.
 
 | Symptom | Likely cause and fix |
 |---|---|
-| Bot exits immediately with "Configuration error" | Fix the listed variables in `.env` (exit code 2). |
+| Bot exits immediately with "Configuration error" | Fix the listed variables in `.env`, or the storage path or permissions it names (exit code 2). |
 | "Discord rejected the token" | `DISCORD_TOKEN` is wrong or was reset (exit code 3). |
 | Slash commands don't appear | Make sure the invite URL had `applications.commands`. Commands sync on startup; restart Discord (Ctrl+R). |
 | Role errors: `forbidden: role ... is not below the bot's highest role` | Move the bot's role above the reward roles. The reset retries automatically (backoff up to 30 min). |

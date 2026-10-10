@@ -41,6 +41,32 @@ class Config:
     log_level: str = "INFO"
 
 
+def prepare_storage(config: Config) -> None:
+    """Create the database and log directories and verify they are writable.
+
+    Raises :class:`ConfigError` so an unusable volume is reported like any other
+    configuration problem (exit code 2, no restart loop) instead of a traceback.
+    """
+    problems: list[str] = []
+    uid = getattr(os, "getuid", lambda: "?")()
+    for label, directory in (("DB_PATH directory", config.db_path.parent), ("LOG_DIR", config.log_dir)):
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            problems.append(f"{label} {directory} cannot be created: {exc.strerror or exc}")
+            continue
+        if not os.access(directory, os.W_OK | os.X_OK):
+            problems.append(f"{label} {directory} is not writable by this user (uid {uid})")
+    if config.db_path.exists() and not os.access(config.db_path, os.R_OK | os.W_OK):
+        problems.append(f"DB_PATH {config.db_path} is not readable and writable by this user (uid {uid})")
+    if problems:
+        raise ConfigError(
+            "Storage is not usable:\n  - "
+            + "\n  - ".join(problems)
+            + "\nIf this is a mounted volume, make it writable by the bot's user (UID 10001 in the Docker image)."
+        )
+
+
 def _expand_path(raw: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(raw.strip())))
 

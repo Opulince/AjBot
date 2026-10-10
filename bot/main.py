@@ -23,13 +23,13 @@ from typing import Any
 
 import discord
 from discord import app_commands
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
 from bot.boards import BoardService
 from bot.clock import Clock, SystemClock
 from bot.commands.admin import register_admin_commands
 from bot.commands.stats import register_stats_command
-from bot.config import Config, ConfigError, load_config
+from bot.config import Config, ConfigError, load_config, prepare_storage
 from bot.counting.buffer import CountBuffer
 from bot.counting.filter import ChannelResolver, ExclusionCache, InstallCache, MessageCounter
 from bot.db.database import Database
@@ -94,8 +94,7 @@ def setup_logging(config: Config) -> None:
     root.setLevel(config.log_level)
     root.addHandler(console)
     root.addHandler(file_handler)
-    # discord.py's gateway logging is chatty at DEBUG; keep it at INFO unless debugging.
-    logging.getLogger("discord").setLevel(logging.INFO if config.log_level != "DEBUG" else logging.DEBUG)
+    logging.getLogger("discord").setLevel(logging.NOTSET)  # follow LOG_LEVEL like everything else
 
 
 # ------------------------------------------------------------------- services
@@ -177,6 +176,7 @@ class LeaderboardBot(discord.Client):
         self.services: Services | None = None
         self._stop = asyncio.Event()
         self._closing = False
+        self._stop_requested = False  # set only by an explicit stop request (SIGTERM/SIGINT)
         self._closed_cleanly = False
         self._flush_task: asyncio.Task | None = None
         self._scheduler_task: asyncio.Task | None = None
@@ -197,6 +197,8 @@ class LeaderboardBot(discord.Client):
             log.info("Synced %d application commands", len(synced))
         except discord.HTTPException as exc:
             log.error("Failed to sync application commands: %s", exc)
+        if self._closing:  # a shutdown signal arrived while starting up
+            return
         self._flush_task = self._spawn(services.buffer.run(self._stop), "count-flush")
         self._scheduler_task = self._spawn(self._scheduler_loop(), "reset-scheduler")
         self._board_task = self._spawn(self._board_loop(), "board-updates")
@@ -214,6 +216,15 @@ class LeaderboardBot(discord.Client):
             log.critical("Background task %s died unexpectedly", task.get_name(), exc_info=exc)
         elif not self._closing:
             log.error("Background task %s exited before shutdown", task.get_name())
+
+    @property
+    def stop_requested(self) -> bool:
+        """True when an operator asked the bot to stop, as opposed to a failure closing it."""
+        return self._stop_requested
+
+    async def request_stop(self) -> None:
+        self._stop_requested = True
+        await self.close()
 
     async def on_ready(self) -> None:
         log.info("Connected as %s (id=%s) in %d guilds", self.user, self.user.id if self.user else "?", len(self.guilds))
@@ -306,7 +317,7 @@ async def run_bot(config: Config) -> int:
 
     def request_shutdown(sig: signal.Signals) -> None:
         log.info("Received %s", sig.name)
-        asyncio.ensure_future(bot.close())
+        asyncio.ensure_future(bot.request_stop())
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -323,15 +334,26 @@ async def run_bot(config: Config) -> int:
     except discord.PrivilegedIntentsRequired:  # pragma: no cover - we request none
         log.error("Discord refused the requested intents")
         return EXIT_BAD_TOKEN
+    except Exception:
+        if bot.stop_requested:
+            # SIGTERM/SIGINT raced startup (e.g. during login or migrations): the
+            # half-started steps fail, but the stop itself was requested. Genuine
+            # failures still propagate (exit 1) so supervisors restart the bot.
+            log.info("Startup interrupted by a shutdown request")
+            return 0
+        raise
     finally:
         await bot.close()  # waits for the final flush and database close
+        await bot.db.close()  # backstop: never leave the connection open (idempotent)
     return 0
 
 
 def main() -> int:
-    load_dotenv()
+    # A .env in the current working directory (as documented), not wherever the code lives.
+    load_dotenv(find_dotenv(usecwd=True))
     try:
         config = load_config()
+        prepare_storage(config)
     except ConfigError as exc:
         print(f"Configuration error.\n{exc}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
