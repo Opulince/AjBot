@@ -19,11 +19,12 @@ import signal
 import sys
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Any
 
 import discord
 from discord import app_commands
-from dotenv import find_dotenv, load_dotenv
+from dotenv import load_dotenv
 
 from bot.boards import BoardService
 from bot.clock import Clock, SystemClock
@@ -348,9 +349,15 @@ async def run_bot(config: Config) -> int:
     return 0
 
 
+def load_env_file() -> None:
+    # Only the .env in the current working directory (as documented): never a parent
+    # directory's, which can belong to another app. A missing file is skipped silently, and
+    # variables already set in the environment win over the file.
+    load_dotenv(Path.cwd() / ".env")
+
+
 def main() -> int:
-    # A .env in the current working directory (as documented), not wherever the code lives.
-    load_dotenv(find_dotenv(usecwd=True))
+    load_env_file()
     try:
         config = load_config()
         prepare_storage(config)

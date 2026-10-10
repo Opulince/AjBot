@@ -139,6 +139,50 @@ def test_dotenv_is_loaded_from_the_working_directory(tmp_path: Path, monkeypatch
             os.environ.pop(key, None)
 
 
+def test_dotenv_is_not_searched_in_parent_directories(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    from bot.main import load_env_file
+
+    work = tmp_path / "work"
+    work.mkdir()
+    (tmp_path / ".env").write_text("LB_TEST_PARENT_ONLY=parent\nLB_TEST_BOTH=parent\n")  # another app's .env
+    (work / ".env").write_text("LB_TEST_CWD_ONLY=cwd\nLB_TEST_BOTH=cwd\nLB_TEST_PRESET=file\n")
+    monkeypatch.chdir(work)
+    keys = ("LB_TEST_PARENT_ONLY", "LB_TEST_CWD_ONLY", "LB_TEST_BOTH")
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("LB_TEST_PRESET", "environment")
+    try:
+        load_env_file()
+        assert os.environ.get("LB_TEST_CWD_ONLY") == "cwd"
+        assert os.environ.get("LB_TEST_BOTH") == "cwd"
+        assert "LB_TEST_PARENT_ONLY" not in os.environ
+        assert os.environ["LB_TEST_PRESET"] == "environment"  # real environment variables take precedence
+    finally:
+        for key in keys:
+            os.environ.pop(key, None)
+
+
+def test_missing_dotenv_in_the_working_directory_is_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    import os
+
+    from bot.main import load_env_file
+
+    work = tmp_path / "work"
+    work.mkdir()
+    (tmp_path / ".env").write_text("LB_TEST_PARENT_ONLY=parent\n")
+    monkeypatch.chdir(work)
+    monkeypatch.delenv("LB_TEST_PARENT_ONLY", raising=False)
+    try:
+        with caplog.at_level("DEBUG"):
+            load_env_file()  # must neither raise nor warn
+        assert "LB_TEST_PARENT_ONLY" not in os.environ
+        assert not caplog.records
+    finally:
+        os.environ.pop("LB_TEST_PARENT_ONLY", None)
+
+
 def test_log_level_applies_to_discord_py_logs(tmp_path: Path) -> None:
     import logging
 
