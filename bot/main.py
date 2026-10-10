@@ -22,6 +22,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
+import aiohttp
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
@@ -33,7 +34,7 @@ from bot.commands.stats import register_stats_command
 from bot.config import Config, ConfigError, load_config, prepare_storage
 from bot.counting.buffer import CountBuffer
 from bot.counting.filter import ChannelResolver, ExclusionCache, InstallCache, MessageCounter
-from bot.db.database import Database
+from bot.db.database import Database, DatabaseClosedError
 from bot.db.repo import Repo
 from bot.discord_ops import DiscordOps, DiscordPyOps
 from bot.ranking import Ranker
@@ -297,22 +298,26 @@ class LeaderboardBot(discord.Client):
 
     async def _shutdown(self) -> None:
         self._closing = True
-        log.info("Shutting down: stopping background tasks")
-        self._stop.set()
-        for task in (self._scheduler_task, self._board_task):
-            if task is not None and not task.done():
-                task.cancel()
-        pending = [t for t in (self._scheduler_task, self._board_task, self._flush_task) if t is not None]
-        if pending:
-            _, not_done = await asyncio.wait(pending, timeout=SHUTDOWN_TASK_TIMEOUT)
-            for task in not_done:
-                log.warning("Task %s did not stop in time", task.get_name())
         try:
-            await super().close()
-        except Exception:
-            log.exception("Error while disconnecting from Discord")
-        await self._final_flush()
-        await self.db.close()
+            log.info("Shutting down: stopping background tasks")
+            self._stop.set()
+            for task in (self._scheduler_task, self._board_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            pending = [t for t in (self._scheduler_task, self._board_task, self._flush_task) if t is not None]
+            if pending:
+                _, not_done = await asyncio.wait(pending, timeout=SHUTDOWN_TASK_TIMEOUT)
+                for task in not_done:
+                    log.warning("Task %s did not stop in time", task.get_name())
+            try:
+                await super().close()
+            except Exception:
+                log.exception("Error while disconnecting from Discord")
+            await self._final_flush()
+        finally:
+            # Last step even when an earlier one failed: an open connection's worker
+            # thread would keep the process from exiting.
+            await self.db.close()
         log.info("Shutdown complete")
 
     async def _final_flush(self) -> None:
@@ -330,6 +335,27 @@ class LeaderboardBot(discord.Client):
 
 
 # ---------------------------------------------------------------------- main
+
+
+def _caused_by_stop(bot: LeaderboardBot, exc: Exception) -> bool:
+    """True if ``exc`` is a known side effect of the stop request itself on a half-started bot.
+
+    Only these may turn into a clean exit. Anything else (a schema newer than supported, a
+    corrupt database, an OSError, ...) is a real failure even if SIGTERM arrived meanwhile.
+    """
+    if not bot.stop_requested:
+        return False
+    if isinstance(exc, DatabaseClosedError):
+        return True  # the stop closed the database under a half-finished setup_hook
+    # The rest is fallout of discord.py closing its HTTP session / gateway mid-startup (matched as
+    # tightly as possible: these types also cover real network faults and plain bugs).
+    if type(exc) is aiohttp.ClientConnectionError and str(exc).startswith("Connector is closed"):
+        return True  # aiohttp connector.py: a login / command sync was in flight when the session closed
+    if type(exc) is RuntimeError and str(exc) == "Session is closed":
+        return True  # aiohttp client.py _request: a request issued after the session was closed
+    # discord.py Client.connect() reads self.ws.sequence while self.ws is still None when the
+    # initial gateway handshake is cut short (ReconnectWebSocket out of the very first poll_event).
+    return isinstance(exc, AttributeError) and exc.name == "sequence" and exc.obj is None
 
 
 async def run_bot(config: Config) -> int:
@@ -355,17 +381,24 @@ async def run_bot(config: Config) -> int:
     except discord.PrivilegedIntentsRequired:  # pragma: no cover - we request none
         log.error("Discord refused the requested intents")
         return EXIT_BAD_TOKEN
-    except Exception:
-        if bot.stop_requested:
-            # SIGTERM/SIGINT raced startup (e.g. during login or migrations): the
-            # half-started steps fail, but the stop itself was requested. Genuine
-            # failures still propagate (exit 1) so supervisors restart the bot.
-            log.info("Startup interrupted by a shutdown request")
-            return 0
-        raise
+    except Exception as exc:
+        if not _caused_by_stop(bot, exc):
+            raise  # a genuine failure, even if a stop was requested meanwhile: exit 1 so supervisors restart
+        # SIGTERM/SIGINT raced startup (e.g. during login or migrations) and the half-started steps failed.
+        log.info("Startup interrupted by a shutdown request (%s: %s)", type(exc).__name__, exc)
+        return 0
     finally:
-        await bot.close()  # waits for the final flush and database close
-        await bot.db.close()  # backstop: never leave the connection open (idempotent)
+        in_flight = sys.exc_info()[1]
+        try:
+            await bot.close()  # waits for the final flush and database close
+        except Exception as exc:
+            if in_flight is None:
+                raise
+            # Never let a failing shutdown replace the failure that got us here, nor go unreported.
+            if exc is not in_flight:
+                log.exception("Error during shutdown (the earlier failure is the one that propagates)")
+        finally:
+            await bot.db.close()  # backstop: never leave the connection open (idempotent)
     return 0
 
 

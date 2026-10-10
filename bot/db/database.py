@@ -41,6 +41,14 @@ class DatabaseError(Exception):
     """Raised for unrecoverable database setup problems."""
 
 
+class DatabaseClosedError(DatabaseError):
+    """The database was used or (re)opened after :meth:`Database.close`, i.e. during shutdown.
+
+    Kept distinct from other :class:`DatabaseError` causes (a schema newer than supported,
+    ...) so startup can tell "the stop request closed the database under us" from a real failure.
+    """
+
+
 class Database:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -56,7 +64,7 @@ class Database:
     async def connect(self) -> None:
         """Open the database, apply pragmas and run pending migrations."""
         if self._closed:
-            raise DatabaseError("Database was closed (shutdown in progress); refusing to reopen")
+            raise DatabaseClosedError("Database was closed (shutdown in progress); refusing to reopen")
         if self._conn is not None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -80,7 +88,7 @@ class Database:
             # close() ran while we were opening (a shutdown signal raced startup):
             # never leave a live connection (and its worker thread) behind.
             await conn.close()
-            raise DatabaseError("Shutdown requested while the database was opening")
+            raise DatabaseClosedError("Shutdown requested while the database was opening")
         self._conn = conn
         log.info("Database ready at %s (schema version %d, journal_mode=%s)", self.path, LATEST_VERSION, mode)
 
@@ -130,6 +138,8 @@ class Database:
         conn = self._conn
         if conn is None:
             self._lock.release()
+            if self._closed:
+                raise DatabaseClosedError("Database is closed (shutdown in progress)")
             raise DatabaseError("Database is not connected")
         self._owner = task
         if conn.in_transaction:

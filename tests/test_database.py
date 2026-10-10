@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 import bot.db.database as database_module
-from bot.db.database import LATEST_VERSION, Database, DatabaseError
+from bot.db.database import LATEST_VERSION, Database, DatabaseClosedError, DatabaseError
 from bot.db.repo import CountDelta, MemberUpdate, Repo
 from tests.conftest import GUILD, T0
 
@@ -227,8 +227,37 @@ async def test_close_before_connect_finishes_wins(tmp_path: Path, monkeypatch: p
     connecting = asyncio.create_task(db.connect())
     await asyncio.sleep(0.05)
     await db.close()
-    with pytest.raises(DatabaseError, match="Shutdown requested"):
+    with pytest.raises(DatabaseClosedError, match="Shutdown requested"):
         await connecting
     assert not db.connected
-    with pytest.raises(DatabaseError, match="closed"):
+    with pytest.raises(DatabaseClosedError, match="closed"):
         await db.connect()
+
+
+async def test_closed_errors_are_distinguishable_from_real_database_errors(tmp_path: Path) -> None:
+    """Startup treats DatabaseClosedError as "the stop closed it"; every other DatabaseError is a real failure."""
+    assert issubclass(DatabaseClosedError, DatabaseError)  # existing `except DatabaseError` callers keep working
+    path = tmp_path / "lb.db"
+
+    never_connected = Database(path)
+    with pytest.raises(DatabaseError, match="not connected") as excinfo:
+        async with never_connected.read():
+            pass
+    assert not isinstance(excinfo.value, DatabaseClosedError)
+
+    seeded = Database(path)
+    await seeded.connect()
+    async with seeded.transaction() as conn:
+        await conn.execute(f"PRAGMA user_version = {LATEST_VERSION + 5}")
+    await seeded.close()
+    with pytest.raises(DatabaseError, match="newer") as excinfo:
+        await Database(path).connect()
+    assert not isinstance(excinfo.value, DatabaseClosedError)
+
+    db = Database(tmp_path / "other.db")
+    await db.connect()
+    await db.close()
+    for use in (db.read, db.transaction):  # used after close: a late setup_hook step
+        with pytest.raises(DatabaseClosedError):
+            async with use():
+                pass
