@@ -403,6 +403,37 @@ async def test_exclusion_cache_loads_from_db(app: App) -> None:
     assert set(cache.excluded_ids(999)) == set()
 
 
+async def test_remove_exclusions_deletes_many_in_one_transaction(app: App, monkeypatch: pytest.MonkeyPatch) -> None:
+    now = app.services.clock.now()
+    for channel_id in (1, 2, 3, 4):
+        await app.repo.add_exclusion(GUILD, channel_id, now)
+    await app.repo.add_exclusion(999, 1, now)
+    transactions: list[int] = []
+    original = app.services.db.transaction
+
+    def spy() -> Any:
+        transactions.append(1)
+        return original()
+
+    monkeypatch.setattr(app.services.db, "transaction", spy)
+    assert await app.repo.remove_exclusions(GUILD, [1, 3, 3, 12345]) == 2  # duplicates and unknown IDs are fine
+    assert len(transactions) == 1
+    assert await app.repo.list_exclusions(GUILD) == [2, 4]
+    assert await app.repo.list_exclusions(999) == [1]  # scoped to the guild
+    assert await app.repo.remove_exclusions(GUILD, []) == 0
+    assert len(transactions) == 1  # nothing to delete: no transaction either
+
+
+async def test_exclusion_cache_remove_many(app: App) -> None:
+    cache = ExclusionCache(app.repo)
+    for channel_id in (1, 2, 3):
+        cache.set_excluded(GUILD, channel_id, True)
+    cache.remove_many(GUILD, {1, 3, 99})
+    assert set(cache.excluded_ids(GUILD)) == {2}
+    cache.remove_many(555, {1})  # unknown guild: nothing to do
+    assert set(cache.excluded_ids(555)) == set()
+
+
 async def test_messages_before_setup_are_not_counted(app: App, world: World, clock: Any) -> None:
     """All-Time means since installation: nothing before /setup, and nothing earlier on the install day."""
     early = world.message(world.text, created_at=datetime(2026, 3, 2, 10, tzinfo=UTC), seq=1)

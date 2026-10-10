@@ -290,7 +290,7 @@ All administrative commands require **Manage Server**. They are hidden from memb
 | `/setup channel:<text channel>` | Sets the leaderboard channel and creates the four boards if they don't exist. The first run records the installation time, which is never changed afterwards. Safe to rerun: existing boards are reused, and changing the channel moves the boards there. |
 | `/exclude add target:<channel or category>` | Stops counting messages there, including in its threads and forum posts. |
 | `/exclude remove target:<channel or category>` | Starts counting there again. |
-| `/exclude list` | Lists the exclusions. Exclusions of channels that have since been deleted are cleaned up automatically. |
+| `/exclude list` | Lists the exclusions (read-only). A channel the bot can't see is listed as "Unknown or deleted channel" with its ID and is never removed by this command. The exclusion of a deleted channel or category is dropped when Discord reports the deletion, and any deleted while the bot was offline are dropped when it next receives that server's full data (startup, or recovery from a Discord outage). |
 | `/setrole period:<daily\|weekly\|monthly> role:<role>` | Sets that period's reward role. Rejects `@everyone` and integration-managed roles, and warns if the bot can't manage the role (hierarchy or permissions). |
 | `/setbanner set url:<https url>` | Sets the banner image. Only `https://` URLs on public hosts are accepted. The URL is never fetched by the bot. |
 | `/setbanner clear` | Removes the banner. |

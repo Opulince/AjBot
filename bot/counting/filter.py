@@ -94,6 +94,11 @@ class ExclusionCache:
         else:
             ids.discard(channel_id)
 
+    def remove_many(self, guild_id: int, channel_ids: Collection[int]) -> None:
+        ids = self._by_guild.get(guild_id)
+        if ids is not None:
+            ids.difference_update(channel_ids)
+
 
 class InstallCache:
     """In-memory mirror of each guild's ``installed_at`` (set by the first /setup).

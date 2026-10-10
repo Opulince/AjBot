@@ -355,6 +355,18 @@ class Repo:
             )
             return cur.rowcount > 0
 
+    async def remove_exclusions(self, guild_id: int, channel_ids: Iterable[int]) -> int:
+        """Delete many exclusions in one transaction; returns how many rows existed."""
+        params = [(guild_id, channel_id) for channel_id in set(channel_ids)]
+        if not params:
+            return 0
+        async with self.db.transaction() as conn:
+            cur = await conn.executemany(
+                "DELETE FROM excluded_channels WHERE guild_id = ? AND channel_id = ?",
+                params,
+            )
+            return cur.rowcount
+
     async def list_exclusions(self, guild_id: int) -> list[int]:
         async with self.db.read() as conn:
             rows = await _fetchall(

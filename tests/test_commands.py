@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +18,7 @@ from bot.commands.admin import (
     describe_forced_run,
     exclude_add,
     exclude_remove,
+    reconcile_exclusions,
     register_admin_commands,
     set_banner,
     set_reward_role,
@@ -99,6 +102,10 @@ async def test_command_structure_and_permissions(app: App) -> None:
         target = exclude.get_command("add").get_parameter("target")  # type: ignore[union-attr]
         types = set(target.channel_types)
         assert {discord.ChannelType.category, discord.ChannelType.text, discord.ChannelType.forum} <= types
+        # Threads can't be picked, so exclusion IDs are always cached channels (never threads).
+        assert not types & {
+            discord.ChannelType.public_thread, discord.ChannelType.private_thread, discord.ChannelType.news_thread
+        }
         period = commands["setrole"].get_parameter("period")  # type: ignore[union-attr]
         assert [c.value for c in period.choices] == ["daily", "weekly", "monthly"]
     finally:
@@ -274,11 +281,231 @@ def test_exclusion_list_never_silently_drops_entries() -> None:
     from bot.commands.admin import format_exclusion_list
 
     lines = [f"• <#{100000000000000000 + i}> (`{100000000000000000 + i}`)" for i in range(120)]
-    text = format_exclusion_list(lines, purged=2)
+    text = format_exclusion_list(lines)
     assert len(text) < 2000
     shown = [line for line in text.splitlines() if line.startswith("•")]
     assert all(line in lines for line in shown)  # whole lines only, never cut mid-mention
     assert f"…and {120 - len(shown)} more not shown" in text
-    assert "Removed 2 exclusion(s)" in text
     assert format_exclusion_list(lines[:3]) == "Excluded:\n" + "\n".join(lines[:3])
-    assert format_exclusion_list([], purged=1).startswith("No channels or categories are excluded.")
+    assert format_exclusion_list([]).startswith("No channels or categories are excluded.")
+
+
+# ----------------------------------------------- /exclude list is read-only; deletes are event-driven
+
+
+def _count_writes(app: App, monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """One entry per write transaction opened from now on."""
+    writes: list[int] = []
+    db = app.services.db
+    original = db.transaction
+
+    def spy() -> Any:
+        writes.append(1)
+        return original()
+
+    monkeypatch.setattr(db, "transaction", spy)
+    return writes
+
+
+def _guild(channels: dict[int, Any] | None = None, *, unavailable: bool = False, guild_id: int = GUILD) -> Any:
+    known = channels or {}
+    return SimpleNamespace(id=guild_id, unavailable=unavailable, get_channel=known.get)
+
+
+def _category(name: str) -> discord.CategoryChannel:
+    category = object.__new__(discord.CategoryChannel)
+    category.name = name
+    return category
+
+
+def _deleted(channel_id: int, guild_id: int = GUILD) -> Any:
+    return SimpleNamespace(id=channel_id, guild=SimpleNamespace(id=guild_id))
+
+
+async def _exclude_list(app: App, guild: Any) -> str:
+    client, tree = await _tree(app.services)
+    try:
+        sent: list[str] = []
+        response = SimpleNamespace(
+            is_done=lambda: False,
+            send_message=lambda message, ephemeral: _record(sent, message),
+        )
+        interaction = SimpleNamespace(guild_id=GUILD, guild=guild, response=response)
+        await tree.get_command("exclude").get_command("list").callback(interaction)  # type: ignore[union-attr]
+        return sent[0]
+    finally:
+        await client.close()
+
+
+@pytest.fixture
+async def lb_bot(app: App, config: Any, clock: Any) -> Any:
+    instance = LeaderboardBot(config, clock=clock)
+    instance.services = app.services
+    yield instance
+    await instance.close()
+
+
+async def test_exclude_list_shows_unresolvable_ids_without_deleting_them(
+    app: App, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for channel_id in (70, 71, 72, 73):
+        await exclude_add(app.services, GUILD, channel_id)
+    guild = _guild({72: SimpleNamespace(mention="<#72>"), 73: _category("Staff *only*")})
+    writes = _count_writes(app, monkeypatch)
+    text = await _exclude_list(app, guild)
+    assert text.splitlines() == [
+        "Excluded:",
+        "• Unknown or deleted channel (`70`)",
+        "• Unknown or deleted channel (`71`)",
+        "• <#72> (`72`)",
+        "• Category **Staff \\*only\\*** (`73`)",
+    ]
+    assert writes == []  # strictly read-only
+    assert await app.repo.list_exclusions(GUILD) == [70, 71, 72, 73]
+    assert set(app.services.exclusions.excluded_ids(GUILD)) == {70, 71, 72, 73}
+
+
+@pytest.mark.parametrize("guild", [None, _guild(unavailable=True)], ids=["no-guild", "partial-uncached-guild"])
+async def test_exclude_list_with_missing_or_empty_guild_lists_every_id(
+    app: App, monkeypatch: pytest.MonkeyPatch, guild: Any
+) -> None:
+    for channel_id in (70, 71, 72):
+        await exclude_add(app.services, GUILD, channel_id)
+    writes = _count_writes(app, monkeypatch)
+    text = await _exclude_list(app, guild)
+    assert text.splitlines() == ["Excluded:", *(f"• Unknown or deleted channel (`{i}`)" for i in (70, 71, 72))]
+    assert writes == []
+    assert await app.repo.list_exclusions(GUILD) == [70, 71, 72]
+    assert set(app.services.exclusions.excluded_ids(GUILD)) == {70, 71, 72}
+
+
+async def test_channel_delete_removes_the_exclusion(app: App, lb_bot: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    await exclude_add(app.services, GUILD, 77)
+    await exclude_add(app.services, GUILD, 78)
+    await exclude_add(app.services, 2, 79)
+    await lb_bot.on_guild_channel_delete(_deleted(77))
+    assert await app.repo.list_exclusions(GUILD) == [78]
+    assert set(app.services.exclusions.excluded_ids(GUILD)) == {78}
+    assert await app.repo.list_exclusions(2) == [79]  # other guilds are untouched
+    writes = _count_writes(app, monkeypatch)
+    await lb_bot.on_guild_channel_delete(_deleted(555))  # an ordinary channel: no database work at all
+    assert writes == []
+
+
+async def test_channel_delete_handler_is_guarded_and_never_raises(
+    app: App, lb_bot: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    await exclude_add(app.services, GUILD, 77)
+    lb_bot._closing = True
+    await lb_bot.on_guild_channel_delete(_deleted(77))
+    lb_bot._closing = False
+    lb_bot.services = None
+    await lb_bot.on_guild_channel_delete(_deleted(77))  # before setup_hook finished
+    lb_bot.services = app.services
+    assert await app.repo.list_exclusions(GUILD) == [77]
+
+    async def broken(*args: Any, **kwargs: Any) -> bool:
+        raise RuntimeError("disk I/O error")
+
+    monkeypatch.setattr(app.repo, "remove_exclusion", broken)
+    with caplog.at_level(logging.ERROR, logger="bot"):
+        await lb_bot.on_guild_channel_delete(_deleted(77))
+    assert "Failed to remove the exclusion of deleted channel 77" in caplog.text
+    assert 77 in app.services.exclusions.excluded_ids(GUILD)  # cache still mirrors the database
+
+
+async def test_events_reach_the_handlers_through_discord_py_dispatch(app: App, lb_bot: Any) -> None:
+    await exclude_add(app.services, GUILD, 77)
+    await exclude_add(app.services, GUILD, 78)
+
+    async def wait_for(expected: list[int]) -> None:
+        for _ in range(100):
+            if await app.repo.list_exclusions(GUILD) == expected:
+                return
+            await asyncio.sleep(0.02)
+        assert await app.repo.list_exclusions(GUILD) == expected
+
+    async with lb_bot:  # what login() does; gives the client its event loop
+        lb_bot.dispatch("guild_channel_delete", _deleted(77))
+        await wait_for([78])
+        lb_bot.dispatch("guild_available", _guild({}))
+        await wait_for([])
+
+
+async def test_reconcile_removes_only_missing_ids_in_one_batch(
+    app: App, lb_bot: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    for channel_id in (10, 11, 12, 13):
+        await exclude_add(app.services, GUILD, channel_id)
+    await exclude_add(app.services, 2, 10)  # same ID in another guild is not ours to touch
+    guild = _guild({11: SimpleNamespace(), 13: SimpleNamespace()})
+    batches: list[tuple[int, list[int]]] = []
+    original = app.repo.remove_exclusions
+
+    async def spy(guild_id: int, channel_ids: Any) -> int:
+        batches.append((guild_id, sorted(channel_ids)))
+        return await original(guild_id, channel_ids)
+
+    async def single(*args: Any) -> bool:
+        raise AssertionError("must not remove one exclusion at a time")
+
+    monkeypatch.setattr(app.repo, "remove_exclusions", spy)
+    monkeypatch.setattr(app.repo, "remove_exclusion", single)
+    writes = _count_writes(app, monkeypatch)
+    with caplog.at_level(logging.INFO, logger="bot.commands.admin"):
+        await lb_bot.on_guild_available(guild)
+    assert batches == [(GUILD, [10, 12])]
+    assert len(writes) == 1  # a single transaction
+    assert [r.getMessage() for r in caplog.records if "Removed" in r.getMessage()] == [
+        f"Removed 2 exclusion(s) of deleted channels: guild={GUILD} channels=[10, 12]"
+    ]
+    assert await app.repo.list_exclusions(GUILD) == [11, 13]
+    assert set(app.services.exclusions.excluded_ids(GUILD)) == {11, 13}
+    assert await app.repo.list_exclusions(2) == [10]
+    assert set(app.services.exclusions.excluded_ids(2)) == {10}
+
+
+async def test_reconcile_ignores_an_unavailable_guild(app: App, lb_bot: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    for channel_id in (10, 11):
+        await exclude_add(app.services, GUILD, channel_id)
+    writes = _count_writes(app, monkeypatch)
+    assert await reconcile_exclusions(app.services, _guild({}, unavailable=True)) == 0
+    await lb_bot.on_guild_available(_guild({}, unavailable=True))
+    assert writes == []  # an empty channel cache from an outage is not "everything was deleted"
+    assert await app.repo.list_exclusions(GUILD) == [10, 11]
+    assert set(app.services.exclusions.excluded_ids(GUILD)) == {10, 11}
+
+
+async def test_reconcile_with_nothing_missing_does_no_writes(
+    app: App, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    await exclude_add(app.services, GUILD, 10)
+    writes = _count_writes(app, monkeypatch)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="bot.commands.admin"):
+        assert await reconcile_exclusions(app.services, _guild({10: SimpleNamespace()})) == 0
+        assert await reconcile_exclusions(app.services, _guild({}, guild_id=999)) == 0  # no exclusions at all
+    assert writes == [] and caplog.records == []
+    assert await app.repo.list_exclusions(GUILD) == [10]
+
+
+async def test_guild_available_handler_is_guarded_and_never_raises(
+    app: App, lb_bot: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    await exclude_add(app.services, GUILD, 10)
+    lb_bot._closing = True
+    await lb_bot.on_guild_available(_guild({}))
+    lb_bot._closing = False
+    lb_bot.services = None
+    await lb_bot.on_guild_available(_guild({}))
+    lb_bot.services = app.services
+    assert await app.repo.list_exclusions(GUILD) == [10]
+
+    async def broken(*args: Any, **kwargs: Any) -> int:
+        raise RuntimeError("disk I/O error")
+
+    monkeypatch.setattr(app.repo, "remove_exclusions", broken)
+    with caplog.at_level(logging.ERROR, logger="bot"):
+        await lb_bot.on_guild_available(_guild({}))
+    assert f"Failed to reconcile exclusions for guild {GUILD}" in caplog.text
+    assert 10 in app.services.exclusions.excluded_ids(GUILD)

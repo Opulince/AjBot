@@ -28,7 +28,7 @@ from dotenv import load_dotenv
 
 from bot.boards import BoardService
 from bot.clock import Clock, SystemClock
-from bot.commands.admin import register_admin_commands
+from bot.commands.admin import exclude_remove, reconcile_exclusions, register_admin_commands
 from bot.commands.stats import register_stats_command
 from bot.config import Config, ConfigError, load_config, prepare_storage
 from bot.counting.buffer import CountBuffer
@@ -237,6 +237,26 @@ class LeaderboardBot(discord.Client):
             await self.services.counter.handle(message)
         except Exception:
             log.exception("Failed to process message %s", message.id)
+
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
+        """Drop the exclusion of a deleted channel or category (fires only for cached channels)."""
+        if self._closing or self.services is None:
+            return
+        try:
+            guild_id = channel.guild.id
+            if channel.id in self.services.exclusions.excluded_ids(guild_id):
+                await exclude_remove(self.services, guild_id, channel.id)
+        except Exception:
+            log.exception("Failed to remove the exclusion of deleted channel %s", channel.id)
+
+    async def on_guild_available(self, guild: discord.Guild) -> None:
+        """Full guild data arrived (startup or recovery from an outage): reconcile exclusions."""
+        if self._closing or self.services is None:
+            return
+        try:
+            await reconcile_exclusions(self.services, guild)
+        except Exception:
+            log.exception("Failed to reconcile exclusions for guild %s", guild.id)
 
     async def _scheduler_loop(self) -> None:
         await self.wait_until_ready()

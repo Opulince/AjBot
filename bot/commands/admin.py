@@ -109,6 +109,25 @@ async def exclude_remove(services: "Services", guild_id: int, channel_id: int) -
     return removed
 
 
+async def reconcile_exclusions(services: "Services", guild: discord.Guild) -> int:
+    """Drop exclusions of channels deleted while the bot was offline; returns how many.
+
+    Trusts only a guild whose channel cache came from a full GUILD_CREATE: an
+    unavailable guild has no channels cached, which must not read as "all deleted".
+    Exclusion targets are channels, forums and categories (never threads), so
+    ``get_channel`` is the right lookup. One batched delete, one cache update.
+    """
+    if guild.unavailable:
+        return 0
+    missing = [i for i in services.exclusions.excluded_ids(guild.id) if guild.get_channel(i) is None]
+    if not missing:
+        return 0
+    removed = await services.repo.remove_exclusions(guild.id, missing)
+    services.exclusions.remove_many(guild.id, missing)
+    log.info("Removed %d exclusion(s) of deleted channels: guild=%s channels=%s", removed, guild.id, sorted(missing))
+    return removed
+
+
 async def set_reward_role(services: "Services", guild_id: int, period: str, role_id: int) -> RoleCheck:
     await services.repo.set_reward_role(guild_id, PeriodType(period), role_id, services.clock.now())
     log.info("Reward role set: guild=%s period=%s role=%s", guild_id, period, role_id)
@@ -122,7 +141,7 @@ async def set_banner(services: "Services", guild_id: int, url: str | None) -> No
         await services.boards.update_guild(guild_id)
 
 
-def format_exclusion_list(lines: list[str], purged: int = 0, limit: int = 1900) -> str:
+def format_exclusion_list(lines: list[str], limit: int = 1900) -> str:
     """Whole-line list that never silently drops entries (Discord caps messages at 2000 chars)."""
     header = "Excluded:" if lines else "No channels or categories are excluded."
     shown: list[str] = []
@@ -134,10 +153,7 @@ def format_exclusion_list(lines: list[str], purged: int = 0, limit: int = 1900) 
             break
         shown.append(line)
         length += len(line) + 1
-    text = "\n".join([header, *shown])
-    if purged:
-        text += f"\nRemoved {purged} exclusion(s) for channels that no longer exist."
-    return text
+    return "\n".join([header, *shown])
 
 
 def describe_forced_run(run: ResetRun) -> str:
@@ -238,22 +254,17 @@ def register_admin_commands(tree: app_commands.CommandTree, services: "Services"
         if not ids:
             await _reply(interaction, "No channels or categories are excluded.")
             return
-        guild = interaction.guild
-        assert guild is not None
+        guild = interaction.guild  # can be None or incomplete; unresolved IDs are shown, never removed
         lines: list[str] = []
-        purged = 0
         for channel_id in ids:
-            channel = guild.get_channel(channel_id)
+            channel = guild.get_channel(channel_id) if guild is not None else None
             if channel is None:
-                # The channel or category was deleted (IDs are never reused): drop the
-                # stale row, since a deleted channel can no longer be picked to remove it.
-                await exclude_remove(services, guild.id, channel_id)
-                purged += 1
+                lines.append(f"• Unknown or deleted channel (`{channel_id}`)")
             elif isinstance(channel, discord.CategoryChannel):
                 lines.append(f"• Category **{discord.utils.escape_markdown(channel.name)}** (`{channel_id}`)")
             else:
                 lines.append(f"• {channel.mention} (`{channel_id}`)")
-        await _reply(interaction, format_exclusion_list(lines, purged))
+        await _reply(interaction, format_exclusion_list(lines))
 
     tree.add_command(exclude)
 
