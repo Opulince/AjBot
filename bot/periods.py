@@ -160,7 +160,8 @@ def day_range(start: datetime, end: datetime) -> tuple[str, str]:
 
     For the aligned daily/weekly/monthly periods this is exact. For a range that
     ends mid-day (forced test resets end at "now") the final day is included in
-    full, which is correct because no counted message can be newer than "now".
+    full; that is only exact while the range is computed promptly, which is why
+    the reset machine refuses to compute a forced test run late.
     """
     start = ensure_utc(start)
     end = ensure_utc(end)

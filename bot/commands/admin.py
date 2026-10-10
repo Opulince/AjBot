@@ -125,6 +125,9 @@ async def set_banner(services: "Services", guild_id: int, url: str | None) -> No
 def describe_forced_run(run: ResetRun) -> str:
     head = f"Forced **test** reset `{run.period_key}` ({run.period_type.value}) — state **{run.status.value}**."
     if run.status is RunStatus.SKIPPED_EMPTY:
+        if run.last_error:  # e.g. a stale forced test run
+            note = run.last_error[0].upper() + run.last_error[1:]
+            return head + f"\n{note}. No announcement or role change was made."
         return head + "\nNobody eligible had messages in this period, so no announcement or role change was made."
     if run.status is RunStatus.DONE:
         winner = f"<@{run.winner_user_id}> with {run.winner_count} messages"
@@ -135,7 +138,8 @@ def describe_forced_run(run: ResetRun) -> str:
     detail = f"\nLast error: {run.last_error}" if run.last_error else ""
     return (
         head
-        + "\nThe reset did not finish; it will keep retrying automatically with backoff."
+        + "\nThe reset did not finish; it will keep retrying automatically with backoff "
+        + "(a test run that can't be computed within a few minutes is closed without a winner)."
         + detail
     )
 

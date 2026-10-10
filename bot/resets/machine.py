@@ -38,6 +38,7 @@ from bot.clock import Clock
 from bot.counting.buffer import CountBuffer
 from bot.db.repo import Repo, ResetRun, RunStatus
 from bot.discord_ops import (
+    RETRYABLE_ERRORS,
     DiscordOps,
     OpError,
     OpNotFound,
@@ -54,8 +55,9 @@ log = logging.getLogger(__name__)
 RETRY_BASE_SECONDS = 30.0
 RETRY_MAX_SECONDS = 1800.0
 ANNOUNCE_SCAN_MARGIN = timedelta(minutes=15)
-ANNOUNCE_SCAN_LIMIT = 100
+ANNOUNCE_SCAN_LIMIT = 1000  # paged by discord.py, 100 messages per request
 PRESENCE_CACHE_TTL = timedelta(seconds=60)
+TEST_RUN_MAX_DELAY = timedelta(minutes=2)
 
 
 def retry_delay(attempts: int) -> float:
@@ -135,6 +137,12 @@ class ResetMachine:
         now = self._clock.now()
         if now < self.due_at(run):
             return run
+        if run.is_test and now > run.period_end + max(self._grace, TEST_RUN_MAX_DELAY):
+            # Day buckets cannot be split at period_end, so a late computation
+            # would include messages sent after the test period ended.
+            note = "stale forced test reset: could not be computed promptly, so no winner was chosen"
+            log.warning("Reset %s: %s", run.describe(), note)
+            return await self._transition(run, RunStatus.SKIPPED_EMPTY, last_error=note)
         if not await self._buffer.flush():
             return await self.fail(run, "flush", "buffer flush failed; winner not computed from unpersisted counts")
         entries = await self._ranker.ranking(run.guild_id, run.period_start, run.period_end, limit=None)
@@ -186,8 +194,22 @@ class ResetMachine:
                 found = await self._find_announcement(run, run.announcement_channel_id)
             except OpNotFound:
                 found = None  # the channel itself is gone, and with it any announcement
-            except OpError as exc:
+            except RETRYABLE_ERRORS as exc:
                 return await self.fail(run, "announce-scan", exc)
+            except OpError as exc:
+                # Forbidden / bad request: the previous channel cannot be read.
+                cfg = await self._repo.get_guild_config(run.guild_id)
+                moved = cfg is not None and cfg.board_channel_id != run.announcement_channel_id
+                if public and not moved:
+                    return await self.fail(run, "announce-scan", exc)
+                log.warning(
+                    "Reset %s cannot scan channel %s for an earlier announcement (%s); %s",
+                    run.describe(),
+                    run.announcement_channel_id,
+                    exc.describe(),
+                    "continuing in the new channel" if public else "recording silently",
+                )
+                found = None
             if found is not None:
                 log.info("Reset %s adopted existing announcement message %s", run.describe(), found)
                 updated = await self._repo.mark_announced(
@@ -205,13 +227,9 @@ class ResetMachine:
         if cfg is None or cfg.board_channel_id is None:
             return await self.fail(run, "announce", "no leaderboard channel configured")
         channel_id = cfg.board_channel_id
-        if run.announce_started_at is None or run.announcement_channel_id != channel_id:
-            run = await self._repo.update_run(
-                run,
-                now,
-                announce_started_at=run.announce_started_at or now,
-                announcement_channel_id=channel_id,
-            )
+        # Any earlier attempt was just ruled out by the scan above, so the
+        # recovery window can start at this attempt.
+        run = await self._repo.update_run(run, now, announce_started_at=now, announcement_channel_id=channel_id)
 
         assert run.winner_user_id is not None and run.winner_count is not None
         member = await self._repo.get_member(run.guild_id, run.winner_user_id)
