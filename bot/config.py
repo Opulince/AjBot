@@ -57,8 +57,12 @@ def prepare_storage(config: Config) -> None:
             continue
         if not os.access(directory, os.W_OK | os.X_OK):
             problems.append(f"{label} {directory} is not writable by this user (uid {uid})")
-    if config.db_path.exists() and not os.access(config.db_path, os.R_OK | os.W_OK):
-        problems.append(f"DB_PATH {config.db_path} is not readable and writable by this user (uid {uid})")
+    # SQLite also opens the WAL/shared-memory/rollback-journal sidecars; one left behind by another user
+    # (a previous root run, a restored backup) would otherwise fail later as a restart-looping startup error.
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        db_file = config.db_path.with_name(config.db_path.name + suffix)
+        if db_file.exists() and not os.access(db_file, os.R_OK | os.W_OK):
+            problems.append(f"DB_PATH {db_file} is not readable and writable by this user (uid {uid})")
     if problems:
         raise ConfigError(
             "Storage is not usable:\n  - "

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import pytest
 
-from bot.config import ConfigError, load_config
+from bot.config import ConfigError, load_config, prepare_storage
 from bot.main import SecretRedactor, setup_logging
 
 TOKEN = "MTIzNDU2Nzg5MDEyMzQ1Njc4.GabcDE.fake_token_value_for_tests_only_xyz"
@@ -118,3 +119,46 @@ def test_setup_logging_writes_rotating_file_without_secrets(tmp_path: Path) -> N
         for handler in saved[0]:
             root.addHandler(handler)
         root.setLevel(saved[1])
+
+
+def _storage_config(tmp_path: Path):
+    return load_config({"DISCORD_TOKEN": TOKEN, "DB_PATH": str(tmp_path / "lb.db"), "LOG_DIR": str(tmp_path / "logs")})
+
+
+def _deny_access(monkeypatch: pytest.MonkeyPatch, *denied: Path) -> None:
+    """Make os.access report ``denied`` as unusable (file modes are ignored when tests run as root)."""
+    real_access = os.access
+    blocked = {str(path) for path in denied}
+    monkeypatch.setattr(os, "access", lambda path, mode, **kw: str(path) not in blocked and real_access(path, mode, **kw))
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_prepare_storage_reports_unwritable_sqlite_sidecar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str) -> None:
+    cfg = _storage_config(tmp_path)
+    cfg.db_path.write_text("")
+    sidecar = tmp_path / f"lb.db{suffix}"
+    sidecar.write_text("")
+    _deny_access(monkeypatch, sidecar)
+    with pytest.raises(ConfigError, match=f"lb.db{suffix} is not readable and writable") as excinfo:
+        prepare_storage(cfg)
+    assert "lb.db is not readable" not in str(excinfo.value)  # only the offending file is reported
+
+
+def test_prepare_storage_reports_every_unusable_database_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _storage_config(tmp_path)
+    files = [tmp_path / name for name in ("lb.db", "lb.db-wal", "lb.db-shm")]
+    for path in files:
+        path.write_text("")
+    _deny_access(monkeypatch, *files)
+    with pytest.raises(ConfigError) as excinfo:
+        prepare_storage(cfg)
+    for path in files:
+        assert f"{path} is not readable and writable" in str(excinfo.value)
+
+
+def test_prepare_storage_accepts_missing_or_writable_sqlite_files(tmp_path: Path) -> None:
+    cfg = _storage_config(tmp_path)
+    prepare_storage(cfg)  # fresh install: no database and no sidecars yet
+    for name in ("lb.db", "lb.db-wal", "lb.db-shm", "lb.db-journal"):
+        (tmp_path / name).write_text("")
+    prepare_storage(cfg)
