@@ -348,3 +348,47 @@ async def test_forbidden_delete_gives_up_after_bounded_attempts(app: App, fake: 
     assert len(fake.board_messages(CHANNEL)) == 5  # one undeletable old board remains
     boards = await app.repo.get_board_messages(GUILD)
     assert all(b.generation == 2 for b in boards.values())
+
+
+async def test_repost_stuck_on_deleted_old_channel_is_abandoned_when_channel_moves(app: App, fake: FakeDiscord) -> None:
+    await install(app)
+    old = await assert_four_boards(app, fake)
+    await _start_repost(app)
+    fake.crash_before("send_message", 2)  # one new board posted into the old channel
+    with pytest.raises(SimulatedCrash):
+        await _process(app)
+    fake.clear_injections()
+    del fake.channels[CHANNEL]  # the old channel is deleted entirely
+    assert not await _process(app)  # would retry forever against the missing channel...
+    fake.add_channel(300)
+    await setup_guild(app.services, GUILD, 300)  # ...until the admin moves the leaderboard
+    await assert_four_boards(app, fake, channel=300)
+    boards = await app.repo.get_board_messages(GUILD)
+    assert not set(old.values()) & {b.message_id for b in boards.values()}
+
+
+async def test_update_moves_boards_after_channel_change_without_repost(app: App, fake: FakeDiscord) -> None:
+    """Crash between saving the new channel and starting its repost: the next update moves the boards."""
+    await install(app)
+    fake.add_channel(400)
+    await app.repo.setup_guild(GUILD, 400, app.services.clock.now())  # config saved, no repost yet
+    await update(app)
+    await assert_four_boards(app, fake, channel=400)
+    assert fake.board_messages(CHANNEL) == []
+
+
+async def test_audit_uses_observation_time_for_departures(app: App, fake: FakeDiscord, clock: FakeClock) -> None:
+    """Regression: a message newer than the audit's start must not block recording the departure."""
+    await install(app)
+    clock.set(dt(2026, 3, 10, 14))
+    await app.messages(GUILD, 13, dt(2026, 3, 10, 14, 0, 2), 1, name="Cara")  # seen after the audit starts
+    fake.remove_member(GUILD, 13)
+
+    def slow_api(op: str) -> None:
+        if op == "fetch_member":
+            clock.advance(seconds=5)  # the API answer arrives a few seconds later
+
+    fake.on_call = slow_api
+    await update(app)
+    member = await app.repo.get_member(GUILD, 13)
+    assert member is not None and member.left_at is not None

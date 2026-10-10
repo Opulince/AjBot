@@ -80,8 +80,9 @@ async def setup_guild(services: "Services", guild_id: int, channel_id: int) -> s
     async with services.locks.get(guild_id):
         before = await services.repo.get_guild_config(guild_id)
         cfg = await services.repo.setup_guild(guild_id, channel_id, now)
+        assert cfg.installed_at is not None
+        services.installs.set_installed(guild_id, cfg.installed_at)  # counting starts now
         ok = await services.boards.ensure_boards(guild_id)
-    assert cfg.installed_at is not None
     first = before is None or before.installed_at is None
     installed = f"<t:{int(cfg.installed_at.timestamp())}:f>"
     head = (

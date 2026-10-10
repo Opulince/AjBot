@@ -60,7 +60,8 @@ PRESENCE_CACHE_TTL = timedelta(seconds=60)
 
 def retry_delay(attempts: int) -> float:
     """Bounded exponential backoff with jitter for a run that failed ``attempts`` times."""
-    base = min(RETRY_BASE_SECONDS * (2 ** max(attempts - 1, 0)), RETRY_MAX_SECONDS)
+    exponent = min(max(attempts - 1, 0), 16)  # avoid float overflow for long-stuck runs
+    base = min(RETRY_BASE_SECONDS * (2 ** exponent), RETRY_MAX_SECONDS)
     return base * random.uniform(0.9, 1.1)
 
 
@@ -151,7 +152,7 @@ class ResetMachine:
                     run, RunStatus.COMPUTED, winner_user_id=entry.user_id, winner_count=entry.count
                 )
             if result.presence is Presence.ABSENT:
-                if await self._repo.mark_member_left(run.guild_id, entry.user_id, now):
+                if await self._repo.mark_member_left(run.guild_id, entry.user_id, self._clock.now()):
                     log.info("Member %s confirmed to have left guild %s", entry.user_id, run.guild_id)
                 log.info("Reset %s skipping departed user %s (rank %d)", run.describe(), entry.user_id, entry.rank)
                 continue
@@ -244,7 +245,13 @@ class ResetMachine:
         guild_id = run.guild_id
         cfg = await self._repo.get_guild_config(guild_id)
         configured = cfg.role_for(run.period_type) if cfg else None
-        role_id = run.role_id if run.role_started_at is not None else configured
+        # Always follow the configured role: if an admin switched it with /setrole
+        # while this run's role work was in flight (e.g. because the old one was
+        # unmanageable), retrying the stale role forever would block every later run.
+        role_id = configured if configured is not None else run.role_id
+        if run.role_started_at is not None and run.role_id is not None and role_id != run.role_id:
+            log.info("Reset %s reward role changed from %s to %s mid-transition", run.describe(), run.role_id, role_id)
+            run = await self._repo.update_run(run, now, role_id=role_id)
 
         if role_id is None:
             updated = await self._repo.complete_roles(
@@ -255,11 +262,6 @@ class ResetMachine:
             return updated
 
         check = self._ops.check_role_manageable(guild_id, role_id)
-        if not check.ok and check.missing_role and configured is not None and configured != role_id:
-            log.info("Reset %s reward role %s was deleted; switching to configured role %s", run.describe(), role_id, configured)
-            role_id = configured
-            run = await self._repo.update_run(run, now, role_id=role_id)
-            check = self._ops.check_role_manageable(guild_id, role_id)
         if not check.ok and check.missing_role:
             updated = await self._repo.complete_roles(
                 run, now, holder_user_id=None, role_id=None, since_key=None,

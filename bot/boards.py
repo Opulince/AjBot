@@ -107,9 +107,12 @@ class BoardService:
             await self.process_repost(guild_id)
             return
         boards = await self._repo.get_board_messages(guild_id)
-        if not boards:
-            log.info("Guild %s has no board messages; starting a repost", guild_id)
-            await self.request_repost(guild_id, "missing boards")
+        if not boards or any(b.channel_id != cfg.board_channel_id for b in boards.values()):
+            # No boards yet, or /setup moved the leaderboard channel (e.g. a crash
+            # happened before its repost started): move them with a full repost.
+            reason = "missing boards" if not boards else "board channel changed"
+            log.info("Guild %s: %s; starting a repost", guild_id, reason)
+            await self.request_repost(guild_id, reason)
             await self.process_repost(guild_id)
             return
         await self._audit_members(guild_id)
@@ -216,12 +219,15 @@ class BoardService:
             result = await check_presence(self._ops, guild_id, user_id, attempts=1)
             if result.presence is Presence.UNKNOWN:
                 continue
-            self._audited[key] = now
+            observed = self._clock.now()  # when the answer arrived, not when the audit began
             if result.presence is Presence.ABSENT and not marked_left:
-                if await self._repo.mark_member_left(guild_id, user_id, now):
+                if await self._repo.mark_member_left(guild_id, user_id, observed):
                     log.info("Member %s confirmed to have left guild %s", user_id, guild_id)
+                else:
+                    continue  # seen after the check (clock skew / just rejoined): re-check next cycle
             elif result.presence is Presence.PRESENT and marked_left:
                 await self._repo.mark_member_present(guild_id, user_id)
+            self._audited[key] = observed
         if len(self._audited) > 50_000:  # bound memory on very long uptimes
             self._audited.clear()
 
@@ -278,6 +284,8 @@ class BoardService:
         cfg = await self._repo.get_guild_config(guild_id)
         if cfg is None or not cfg.installed:
             return False
+        if op.status is RepostStatus.POSTING and op.channel_id != cfg.board_channel_id:
+            return await self._abandon(op)
         try:
             if op.status is RepostStatus.POSTING:
                 op = await self._post_missing(op, cfg)
@@ -289,6 +297,33 @@ class BoardService:
             log.warning("Board repost for guild %s changed concurrently; will re-read next cycle", guild_id)
             return False
         return op.status is RepostStatus.DONE
+
+    async def _abandon(self, op: RepostOp) -> bool:
+        """Drop a POSTING op whose target channel is no longer the configured one.
+
+        The old boards it would have replaced stay tracked in ``board_messages``
+        (nothing was deleted yet), so the next repost replaces them in the new
+        channel. Boards this op already posted are removed best-effort; failures
+        (e.g. the old channel was deleted) do not block the move.
+        """
+        for board_type, message_id in op.new_ids.items():
+            try:
+                await self._ops.delete_message(op.channel_id, message_id)
+            except OpError as exc:
+                log.warning(
+                    "Could not delete %s board %s from abandoned repost in guild %s: %s",
+                    board_type,
+                    message_id,
+                    op.guild_id,
+                    exc.describe(),
+                )
+        await self._repo.repost_abandon(op.guild_id, op.generation, self._clock.now())
+        log.warning(
+            "Board repost guild=%s generation=%s abandoned: the leaderboard channel changed",
+            op.guild_id,
+            op.generation,
+        )
+        return True
 
     async def _post_missing(self, op: RepostOp, cfg: GuildConfig) -> RepostOp | None:
         missing = [t for t in BOARD_ORDER if t not in op.new_ids]

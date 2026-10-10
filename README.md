@@ -92,6 +92,10 @@ counts are never deleted. They are skipped when choosing a reward winner: the bo
 ranking to the first person confirmed to still be in the server. A temporary API error never
 disqualifies anyone; the reset just retries later.
 
+If the frozen winner leaves between being chosen and receiving the role, the role is removed from
+the previous holder and stays unassigned until the next reset. The winner is never silently swapped
+for someone else.
+
 ## Installing Python and dependencies
 
 Install Python 3.11 or newer from [python.org](https://www.python.org/downloads/) or your package
