@@ -1,0 +1,6 @@
+# Runtime dependencies (pinned). discord.py 2.7.1 provides DynamicItem (added in 2.4),
+# Client.add_dynamic_items, app_commands and PartialMessage.edit(view=...), all of
+# which this bot uses. audioop-lts is pulled in automatically on Python 3.13+.
+discord.py==2.7.1
+aiosqlite==0.22.1
+python-dotenv==1.2.3
