@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Any, Awaitable, Callable, Iterator, Sequence, TypeVar
+from urllib.parse import unquote
 
 import aiohttp
 import discord
@@ -99,10 +100,16 @@ class HistoryMessage:
     content: str
     footers: tuple[str, ...]
     created_at: datetime
+    links: tuple[str, ...] = ()  # embed author/title URLs (boards carry their marker in the author link)
+
+    @property
+    def marker_texts(self) -> tuple[str, ...]:
+        """Every place a marker may be stored: content, embed footers and (URL-decoded) embed links."""
+        return (self.content, *self.footers, *(unquote(link) for link in self.links))
 
     def contains_marker(self, marker: str) -> bool:
         """Exact marker match (``board:1:daily:5`` must not match ``board:1:daily:50``)."""
-        return has_marker(self.content, marker) or any(has_marker(f, marker) for f in self.footers)
+        return any(has_marker(text, marker) for text in self.marker_texts)
 
 
 def has_marker(text: str, marker: str) -> bool:
@@ -409,6 +416,7 @@ class DiscordPyOps(DiscordOps):
             channel = self._messageable(channel_id)
             async for msg in channel.history(limit=limit, after=after_obj, oldest_first=after_obj is not None):
                 footers = tuple(e.footer.text for e in msg.embeds if e.footer and e.footer.text)
+                links = tuple(url for e in msg.embeds for url in (e.author.url, e.url) if url)
                 result.append(
                     HistoryMessage(
                         id=msg.id,
@@ -416,6 +424,7 @@ class DiscordPyOps(DiscordOps):
                         content=msg.content or "",
                         footers=footers,
                         created_at=msg.created_at,
+                        links=links,
                     )
                 )
         if after_obj is None:

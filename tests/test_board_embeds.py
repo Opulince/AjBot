@@ -102,13 +102,13 @@ def test_podium_gets_medals_and_ranks_four_to_ten_stay_compact() -> None:
     blocks = (embed.description or "").split("\n\n")
     assert blocks[0] == "Standings for **Tue 10 Mar 2026** (UTC)"
     assert blocks[1].split("\n") == [
-        "🥇 <@101> · User1 — **99 messages**",
-        "🥈 <@102> · User2 — **98 messages**",
-        "🥉 <@103> · User3 — **97 messages**",
+        "🥇 <@101> · User1 — **99 messages** 💬",
+        "🥈 <@102> · User2 — **98 messages** 💬",
+        "🥉 <@103> · User3 — **97 messages** 💬",
     ]
     rest = blocks[2].split("\n")
-    assert rest[0] == "`#4` <@104> · User4 — 96 messages"
-    assert rest[-1] == "`#10` <@110> · User10 — 90 messages"
+    assert rest[0] == "`#4` <@104> · User4 — 96 messages 💬"
+    assert rest[-1] == "`#10` <@110> · User10 — 90 messages 💬"
     assert len(rest) == 7 and len(blocks) == 3
     assert "<@111>" not in (embed.description or "") and "<@112>" not in (embed.description or "")  # top 10 only
 
@@ -123,15 +123,15 @@ def test_short_board_has_no_empty_compact_block() -> None:
 def test_counts_use_thousands_separators_and_singular() -> None:
     embed = render("alltime", [entry(1, count=12_345), entry(4, count=1)])
     desc = embed.description or ""
-    assert "**12,345 messages**" in desc
-    assert desc.endswith("— 1 message")
+    assert "**12,345 messages** 💬" in desc
+    assert desc.endswith("— 1 message 💬")
 
 
 def test_departed_members_keep_their_label_on_board_rows() -> None:
     embed = render("monthly", [entry(1, name="Alice", left=True), entry(5, name="Bob", left=True)])
     desc = embed.description or ""
-    assert "🥇 <@101> · Alice (left) — **99 messages**" in desc
-    assert "`#5` <@105> · Bob (left) — 95 messages" in desc
+    assert "🥇 <@101> · Alice (left) — **99 messages** 💬" in desc
+    assert "`#5` <@105> · Bob (left) — 95 messages 💬" in desc
 
 
 def test_names_are_escaped_and_truncated_with_the_shared_helper() -> None:
@@ -203,15 +203,26 @@ def test_reset_field_uses_relative_and_absolute_discord_timestamps() -> None:
 
 
 @pytest.mark.parametrize("board_type", BOARD_ORDER)
-def test_footer_keeps_the_exact_recovery_marker(board_type: str) -> None:
-    footer = render(board_type, generation=7).footer.text or ""
-    assert footer == f"1 message = 1 point · board:{GUILD}:{board_type}:7 · Last updated"
-    assert parse_board_marker(footer) == (GUILD, board_type, 7)
-    msg = HistoryMessage(1, 2, "", (footer,), NOW)
+def test_recovery_marker_lives_in_the_author_link_not_a_visible_footer(board_type: str) -> None:
+    embed = render(board_type, generation=7)
+    assert embed.footer.text is None  # nothing visible below the board but the timestamp
+    assert embed.timestamp == NOW
+    link = embed.author.url or ""
+    assert link == f"https://discord.com/channels/{GUILD}#board:{GUILD}:{board_type}:7"
+    assert parse_board_marker(link) == (GUILD, board_type, 7)
+    msg = HistoryMessage(1, 2, "", (), NOW, (link,))
     assert msg.contains_marker(board_marker(GUILD, board_type, 7))
     assert not msg.contains_marker(board_marker(GUILD, board_type, 70))  # no prefix matches
-    longer = HistoryMessage(1, 2, "", (render(board_type, generation=70).footer.text or "",), NOW)
+    longer = HistoryMessage(1, 2, "", (), NOW, (render(board_type, generation=70).author.url or "",))
     assert not longer.contains_marker(board_marker(GUILD, board_type, 7))
+    # Discord may percent-encode the link; the marker is still found.
+    encoded = HistoryMessage(1, 2, "", (), NOW, (link.replace(":", "%3A").replace("https%3A", "https:"),))
+    assert encoded.contains_marker(board_marker(GUILD, board_type, 7))
+
+
+def test_boards_posted_with_the_old_footer_marker_are_still_recognised() -> None:
+    old = HistoryMessage(1, 2, "", ("Last updated · board:1:daily:3",), NOW)
+    assert old.contains_marker(board_marker(1, "daily", 3))
 
 
 def test_banner_is_optional() -> None:
@@ -230,10 +241,10 @@ def test_worst_case_board_stays_within_discord_limits(board_type: str) -> None:
     assert len(embed) <= 6000
     assert len(embed.title or "") <= 256 and len(embed.author.name or "") <= 256
     assert len(embed.description or "") <= 4096
-    assert len(embed.footer.text or "") <= 2048
     assert len(embed.fields) <= 25
     assert all(len(f.name or "") <= 256 and len(f.value or "") <= 1024 for f in embed.fields)
-    assert parse_board_marker(embed.footer.text or "") == (big_id, board_type, 2**31)
+    assert len(embed.author.url or "") <= 2048
+    assert parse_board_marker(embed.author.url or "") == (big_id, board_type, 2**31)
 
 
 # ------------------------------------------- other embeds are left as they were
