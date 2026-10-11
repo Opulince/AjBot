@@ -270,6 +270,41 @@ async def test_messages_are_sent_with_an_enforced_nonce() -> None:
     assert params.payload["enforce_nonce"] is True and params.payload["nonce"] == str(nonces[0])
 
 
+
+async def test_history_scan_reads_board_markers_from_author_links_and_old_footers() -> None:
+    """The production history scan must find markers in the new author link and in old-style footers."""
+    from bot.discord_ops import DiscordPyOps
+    from bot.ui.embeds import board_marker, build_board_embed
+
+    new_board = build_board_embed(
+        guild_id=GUILD, board_type="daily", generation=3, entries=[], previous=None,
+        next_reset=datetime(2026, 3, 11, tzinfo=UTC), banner_url=None, now=datetime(2026, 3, 10, 12, tzinfo=UTC),
+    )
+    # Rebuild from the API-shaped dict, as discord.py does for fetched messages.
+    fetched_new = discord.Embed.from_dict(new_board.to_dict())
+    fetched_old = discord.Embed.from_dict({"footer": {"text": f"Last updated · board:{GUILD}:weekly:2"}})
+    messages = [
+        SimpleNamespace(id=1, author=SimpleNamespace(id=9), content="", embeds=[fetched_new], created_at=None),
+        SimpleNamespace(id=2, author=SimpleNamespace(id=9), content="", embeds=[fetched_old], created_at=None),
+        SimpleNamespace(id=3, author=SimpleNamespace(id=9), content="hi", embeds=[discord.Embed(title="x")], created_at=None),
+    ]
+
+    class History(discord.abc.Messageable):
+        async def _get_channel(self) -> Any:
+            return self
+
+        async def history(self, **_kwargs: Any) -> Any:  # type: ignore[override]
+            for message in messages:
+                yield message
+
+    channel = History()
+    ops = DiscordPyOps(SimpleNamespace(get_channel=lambda _cid: channel))  # type: ignore[arg-type]
+    found = {m.id: m for m in await ops.recent_history(5, after=datetime(2026, 3, 10, tzinfo=UTC), limit=10)}
+    assert found[1].contains_marker(board_marker(GUILD, "daily", 3))
+    assert not found[1].contains_marker(board_marker(GUILD, "daily", 30))
+    assert found[2].contains_marker(board_marker(GUILD, "weekly", 2))
+    assert found[3].links == () and not found[3].contains_marker(board_marker(GUILD, "daily", 3))
+
 def test_exclusion_list_never_silently_drops_entries() -> None:
     from bot.commands.admin import format_exclusion_list
 
