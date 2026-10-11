@@ -10,9 +10,10 @@ import pytest
 
 from bot.clock import UTC
 from bot.commands.admin import setup_guild
-from bot.db.repo import RepostStatus
+from bot.db.repo import RepostStatus, RunStatus
 from bot.discord_ops import OpBadRequest, OpForbidden, OpNetwork, OpRateLimited, OpTransient
-from bot.periods import BOARD_ORDER, unix_timestamp
+from bot.periods import BOARD_ORDER, parse_period_key, unix_timestamp
+from bot.ui.embeds import parse_board_marker
 from tests.conftest import CHANNEL, GUILD, ROLE_DAILY, ROLE_MONTHLY, ROLE_WEEKLY, T0, install
 from tests.fakes import App, FakeClock, FakeDiscord, SimulatedCrash, make_config
 
@@ -60,7 +61,8 @@ async def test_setup_posts_four_boards_in_order(app: App, fake: FakeDiscord) -> 
     assert [m.board for m in msgs] == [(GUILD, t, 1) for t in BOARD_ORDER]
     for m in msgs:
         assert m.components == [f"lb:more:{m.board[1]}"]
-        assert m.embed is not None and m.embed["footer"]["text"].startswith("Last updated · board:")
+        assert m.embed is not None
+        assert m.embed["footer"]["text"] == f"1 message = 1 point · board:{GUILD}:{m.board[1]}:1 · Last updated"
     cfg = await app.repo.get_guild_config(GUILD)
     assert cfg is not None and cfg.installed_at == T0
 
@@ -170,17 +172,23 @@ async def test_board_embed_contents(app: App, fake: FakeDiscord, clock: FakeCloc
     await app.repo.set_banner(GUILD, "https://cdn.example.com/b.png", clock.now())
     await update(app)
     by_type = {m.board[1]: m.embed for m in fake.board_messages(CHANNEL)}
+    boards = await app.repo.get_board_messages(GUILD)
     daily = by_type["daily"]
-    assert daily["title"] == "Daily Leaderboard"
+    assert daily is not None
+    assert daily["title"] == "☀️ Daily Leaderboard"
+    assert daily["author"]["name"] == "Community Activity Championship"
     assert daily["image"]["url"] == "https://cdn.example.com/b.png"
     fields = {f["name"]: f["value"] for f in daily["fields"]}
-    assert "<@11>" in fields["Previous winner"] and "2026-03-10" in fields["Previous winner"]
+    assert list(fields) == ["Previous Member of the Day", "Next reset"]
+    assert "<@11>" in fields["Previous Member of the Day"] and "2026-03-10" in fields["Previous Member of the Day"]
     ts = unix_timestamp(dt(2026, 3, 12))
-    assert f"<t:{ts}:R>" in fields["Next reset"]
-    assert daily["footer"]["text"].startswith("Last updated · board:1:daily:")
-    assert "timestamp" in daily
+    assert fields["Next reset"] == f"<t:{ts}:R>\n<t:{ts}:f>"
+    footer = daily["footer"]["text"]
+    assert parse_board_marker(footer) == (GUILD, "daily", boards["daily"].generation)
+    assert footer.startswith("1 message = 1 point · board:1:daily:") and footer.endswith(" · Last updated")
+    assert daily["timestamp"] == clock.now().isoformat()
     alltime = by_type["alltime"]
-    assert "Next reset" not in {f["name"] for f in alltime.get("fields", [])}
+    assert alltime is not None and alltime.get("fields", []) == []  # no previous winner, no reset countdown
     assert "<@11> · Alice\\*Star — **3 messages**" in alltime["description"]  # mention + escaped plain name
     assert "<@12> · Bob (left)" in alltime["description"]
 
@@ -463,3 +471,186 @@ async def test_sweep_never_touches_other_users_or_tracked_boards(app: App, fake:
     assert await _process(app)
     await assert_four_boards(app, fake)
     assert any(m.id == chat for m in fake.messages(CHANNEL))
+
+
+# ------------------------------------------------------- previous winners
+
+
+async def rendered(app: App, fake: FakeDiscord) -> dict[str, dict]:
+    """Run a normal board update and return each board's embed by type."""
+    await update(app)
+    embeds: dict[str, dict] = {}
+    for m in fake.board_messages(CHANNEL):
+        assert m.board is not None and m.embed is not None
+        embeds[m.board[1]] = m.embed
+    return embeds
+
+
+def field(embed: dict, name: str) -> str:
+    values = [f["value"] for f in embed.get("fields", []) if f["name"] == name]
+    assert len(values) == 1, (name, embed.get("fields"))
+    return values[0]
+
+
+async def test_each_board_shows_its_own_previous_winner_after_missed_boundaries(
+    app: App, fake: FakeDiscord, clock: FakeClock
+) -> None:
+    await install(app)  # Tuesday 2026-03-10, ISO week 2026-W11
+    await app.messages(GUILD, 13, dt(2026, 3, 12, 13), 8, name="Cara")   # W11, March -> March champion
+    await app.messages(GUILD, 11, dt(2026, 3, 24, 13), 5, name="Alice")  # W13, March -> W13 champion
+    await app.messages(GUILD, 12, dt(2026, 3, 31, 13), 3, name="Bob")    # W14, March -> 03-31 champion
+    clock.set(dt(2026, 4, 1, 0, 5))  # offline since install: 22 daily, 3 weekly and 1 monthly boundary
+    await app.runner.tick()
+    weekly_runs = {r.period_key: r.status for r in await app.repo.list_runs(GUILD, "weekly")}
+    assert weekly_runs["2026-W12"] is RunStatus.SKIPPED_EMPTY  # an older, empty week sits in between
+    boards = await rendered(app, fake)
+
+    daily = field(boards["daily"], "Previous Member of the Day")
+    assert daily == "🏆 <@12> · Bob\n**3 messages** · 2026-03-31 (UTC)"
+    weekly = field(boards["weekly"], "Previous Member of the Week")
+    assert weekly == "🏆 <@11> · Alice\n**5 messages** · ISO week 2026-W13"
+    monthly = field(boards["monthly"], "Previous Member of the Month")
+    assert monthly == "🏆 <@13> · Cara\n**8 messages** · 2026-03"
+    for board_type, label in (
+        ("daily", "Previous Member of the Day"),
+        ("weekly", "Previous Member of the Week"),
+        ("monthly", "Previous Member of the Month"),
+    ):
+        assert [f["name"] for f in boards[board_type]["fields"]] == [label, "Next reset"]
+    assert boards["alltime"].get("fields", []) == []
+
+
+async def test_previous_winner_shows_the_frozen_count_and_escaped_name(
+    app: App, fake: FakeDiscord, clock: FakeClock
+) -> None:
+    await install(app)
+    await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 3, name="Alice*Star")
+    clock.set(dt(2026, 3, 11, 0, 3))
+    await app.runner.tick()
+    # Late deliveries still land in the closed day's bucket, but the recorded result is final.
+    await app.messages(GUILD, 11, dt(2026, 3, 10, 23, 59), 2, name="Alice*Star")
+    value = field((await rendered(app, fake))["daily"], "Previous Member of the Day")
+    assert value == "🏆 <@11> · Alice\\*Star\n**3 messages** · 2026-03-10 (UTC)"
+
+
+async def test_departed_previous_winner_is_labelled(app: App, fake: FakeDiscord, clock: FakeClock) -> None:
+    await install(app)
+    await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 3, name="Alice")
+    clock.set(dt(2026, 3, 11, 0, 3))
+    await app.runner.tick()
+    fake.remove_member(GUILD, 11)
+    await app.repo.mark_member_left(GUILD, 11, clock.now())
+    value = field((await rendered(app, fake))["daily"], "Previous Member of the Day")
+    assert value.startswith("🏆 <@11> · Alice (left)\n")
+
+
+async def test_first_tracked_period_has_no_previous_result(app: App, fake: FakeDiscord) -> None:
+    await install(app)
+    boards = await rendered(app, fake)
+    assert field(boards["daily"], "Previous Member of the Day") == "None yet — this is the first day being tracked."
+    assert field(boards["weekly"], "Previous Member of the Week") == "None yet — this is the first week being tracked."
+    assert field(boards["monthly"], "Previous Member of the Month") == "None yet — this is the first month being tracked."
+
+
+async def test_empty_previous_period_is_shown_instead_of_an_older_winner(
+    app: App, fake: FakeDiscord, clock: FakeClock
+) -> None:
+    await install(app)
+    await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 3)
+    clock.set(dt(2026, 3, 12, 0, 5))  # Mar 10 has a winner, Mar 11 nobody
+    await app.runner.tick()
+    value = field((await rendered(app, fake))["daily"], "Previous Member of the Day")
+    assert value == "No eligible winner\n2026-03-11 (UTC)"
+
+
+async def test_undecided_previous_period_never_falls_back_to_an_older_winner(
+    app: App, fake: FakeDiscord, clock: FakeClock
+) -> None:
+    """Regression: the board used to show the latest *decided* run, i.e. Mar 10's winner on Mar 12."""
+    await install(app)
+    await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 3)
+    clock.set(dt(2026, 3, 11, 0, 3))
+    await app.runner.tick()
+    clock.set(dt(2026, 3, 12, 0, 1))  # Mar 11 is still inside its grace period
+    await app.runner.tick()
+    assert (await app.repo.get_run_by_key(GUILD, "daily", "2026-03-11")).status is RunStatus.PENDING  # type: ignore[union-attr]
+    value = field((await rendered(app, fake))["daily"], "Previous Member of the Day")
+    assert value == "*Tallying results…*\n2026-03-11 (UTC)"
+    clock.set(dt(2026, 3, 12, 0, 2))
+    await app.runner.tick()
+    value = field((await rendered(app, fake))["daily"], "Previous Member of the Day")
+    assert value == "No eligible winner\n2026-03-11 (UTC)"
+
+
+async def test_board_after_downtime_waits_for_catch_up_then_shows_latest_result(
+    app: App, fake: FakeDiscord, clock: FakeClock
+) -> None:
+    await install(app)
+    await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 3)
+    clock.set(dt(2026, 3, 11, 0, 3))
+    await app.runner.tick()  # Mar 10: user 11
+    await app.messages(GUILD, 13, dt(2026, 3, 11, 13), 2)  # Mar 11: user 13; Mar 12: nobody
+    await app.messages(GUILD, 12, dt(2026, 3, 13, 13), 4)  # Mar 13: user 12
+    clock.set(dt(2026, 3, 14, 0, 10))  # the bot was down across three boundaries
+    # The board loop can win the guild lock before the reset catch-up has created the missed runs.
+    value = field((await rendered(app, fake))["daily"], "Previous Member of the Day")
+    assert value == "*Tallying results…*\n2026-03-13 (UTC)"
+    await app.runner.tick()
+    value = field((await rendered(app, fake))["daily"], "Previous Member of the Day")
+    assert value == "🏆 <@12> · user12\n**4 messages** · 2026-03-13 (UTC)"
+
+
+async def test_forced_test_resets_never_become_the_previous_winner(
+    app: App, fake: FakeDiscord, clock: FakeClock
+) -> None:
+    await install(app)
+    await app.messages(GUILD, 12, dt(2026, 3, 10, 12, 30), 4)
+    clock.set(dt(2026, 3, 10, 18))
+    test_run = await app.runner.force_reset(GUILD, "daily")
+    assert test_run.is_test and test_run.winner_user_id == 12
+    await app.runner.force_reset(GUILD, "weekly")
+    boards = await rendered(app, fake)
+    assert field(boards["daily"], "Previous Member of the Day") == "None yet — this is the first day being tracked."
+    assert field(boards["weekly"], "Previous Member of the Week") == "None yet — this is the first week being tracked."
+
+    await app.messages(GUILD, 11, dt(2026, 3, 10, 19), 5)
+    clock.set(dt(2026, 3, 11, 0, 3))
+    await app.runner.tick()  # real Mar 10 result: user 11 with 5
+    await app.messages(GUILD, 12, dt(2026, 3, 11, 13), 9)
+    clock.set(dt(2026, 3, 11, 18))
+    assert (await app.runner.force_reset(GUILD, "daily")).winner_user_id == 12  # a newer test winner
+    value = field((await rendered(app, fake))["daily"], "Previous Member of the Day")
+    assert value == "🏆 <@11> · user11\n**5 messages** · 2026-03-10 (UTC)"
+
+
+async def test_previous_result_reads_exactly_one_real_period(app: App, clock: FakeClock) -> None:
+    await install(app)
+    now = clock.now()
+    day = parse_period_key("daily", "2026-03-10")
+    await app.repo.create_runs(GUILD, [day], now)
+    test_run = await app.repo.create_test_run(GUILD, "daily", "test-2026-03-10-x", day.start, now, now)
+    run = await app.repo.previous_result(GUILD, "daily", "2026-03-10")
+    assert run is not None and run.period_key == "2026-03-10" and run.status is RunStatus.PENDING and not run.is_test
+    assert await app.repo.previous_result(GUILD, "daily", test_run.period_key) is None
+    assert await app.repo.previous_result(GUILD, "weekly", "2026-03-10") is None
+    assert await app.repo.previous_result(GUILD, "daily", "2026-03-09") is None
+
+
+async def test_board_posted_with_the_old_footer_is_still_adopted(app: App, fake: FakeDiscord) -> None:
+    """Boards posted before this layout change carry ``Last updated · board:…``; recovery must still find them."""
+    await install(app)
+    ids = await assert_four_boards(app, fake)
+    old_style = next(m for m in fake.board_messages(CHANNEL) if m.id == ids["daily"])
+    old_style.embed = {"title": "Daily Leaderboard", "footer": {"text": f"Last updated · board:{GUILD}:daily:1"}}
+    stale = await app.repo.get_board_messages(GUILD)
+    # The tracked ID points at a message that no longer exists; the old-style board is an orphan to adopt.
+    await app.repo.set_board_message(GUILD, "daily", CHANNEL, ids["daily"] + 10_000, stale["daily"].generation)
+    sends = fake.count("send_message")
+    await update(app)
+    assert fake.count("send_message") == sends  # adopted, not reposted
+    assert (await assert_four_boards(app, fake))["daily"] == ids["daily"]
+    await update(app)  # the next normal update edits it in place with the new layout
+    adopted = next(m for m in fake.board_messages(CHANNEL) if m.id == ids["daily"])
+    assert adopted.embed is not None
+    assert adopted.embed["title"] == "☀️ Daily Leaderboard"
+    assert adopted.embed["footer"]["text"] == f"1 message = 1 point · board:{GUILD}:daily:1 · Last updated"

@@ -907,14 +907,18 @@ class Repo:
             since_key=row["since_key"],
         )
 
-    async def previous_result(self, guild_id: int, ptype: PeriodType | str) -> ResetRun | None:
-        """Most recent real run of ``ptype`` whose outcome is decided (winner frozen or empty)."""
+    async def previous_result(self, guild_id: int, ptype: PeriodType | str, period_key: str) -> ResetRun | None:
+        """The real (non-test) run of exactly ``period_key``, whatever its status.
+
+        Boards ask for the period immediately before the current one. Looking up
+        that key instead of "the latest decided run" means a run that is still
+        PENDING (grace period, retries, catch-up after downtime) is reported as
+        such, rather than an older period's winner being shown in its place.
+        """
         async with self.db.read() as conn:
             row = await _fetchone(
                 conn,
-                "SELECT * FROM reset_runs WHERE guild_id = ? AND period_type = ? AND is_test = 0 "
-                "AND status IN ('COMPUTED', 'ANNOUNCED', 'ROLES_DONE', 'DONE', 'ROLES_SUPERSEDED', 'SKIPPED_EMPTY') "
-                "ORDER BY period_end DESC LIMIT 1",
-                (guild_id, PeriodType(ptype).value),
+                "SELECT * FROM reset_runs WHERE guild_id = ? AND period_type = ? AND period_key = ? AND is_test = 0",
+                (guild_id, PeriodType(ptype).value, period_key),
             )
         return _run(row) if row else None

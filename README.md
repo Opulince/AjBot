@@ -37,9 +37,15 @@ everything in a single SQLite file.
 ## Features
 
 - **Four boards** posted as four messages in one channel, in this order: Daily, Weekly, Monthly, All-Time.
-  Each board shows the top 10 (rank, mention, plain-text name, message count), the previous period's
-  winner, the next reset as a Discord relative timestamp (not on All-Time), an optional banner image
-  and a "last updated" footer.
+  Each board shows the top 10 (rank, mention, plain-text name, message count; medals for the top
+  three), the UTC day, week or month it is counting, the previous period's winner (not on All-Time),
+  the next reset as a Discord relative and absolute timestamp (not on All-Time), an optional banner
+  image and a "last updated" footer.
+- **Previous winner** fields are labelled *Previous Member of the Day / Week / Month* and always
+  describe the period immediately before the current one, with its key: its winner and recorded
+  count, "No eligible winner" if nobody qualified, or "Tallying results…" while that period's reset
+  is still being decided (grace period, retries, catch-up after downtime). An older period's winner
+  is never shown in its place, and `/forcereset` test runs are never used.
 - **Show 11–100** button on every board: an ephemeral, paginated view of ranks 11–100 (15 per page,
   Prev/Next). The ranking is recomputed on every click, and the buttons keep working after restarts.
 - **Automatic resets** at UTC boundaries (daily at 00:00, weekly on Monday 00:00 using ISO weeks,
