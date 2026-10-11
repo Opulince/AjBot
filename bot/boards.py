@@ -25,6 +25,7 @@ All public methods assume the caller holds the guild's lock.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 
@@ -55,6 +56,14 @@ SINGLE_SCAN_LIMIT = 100
 SWEEP_LIMIT = 200
 MAX_DELETE_ATTEMPTS = 5
 AUDIT_TTL = timedelta(hours=6)
+# Pause between the four in-place edits of one refresh. Sent back to back, the
+# last edit hit Discord's per-channel rate limit (429, ~5 s retry) every cycle.
+EDIT_SPACING_SECONDS = 2.0
+
+
+async def _edit_pause(delay: float) -> None:
+    """Indirection so tests can skip the pause between board edits."""
+    await asyncio.sleep(delay)
 
 
 class BoardService:
@@ -129,7 +138,9 @@ class BoardService:
             return
         await self._audit_members(guild_id)
         generation = max(b.generation for b in boards.values())
-        for board_type in BOARD_ORDER:
+        for index, board_type in enumerate(BOARD_ORDER):
+            if index:
+                await _edit_pause(EDIT_SPACING_SECONDS)
             board = boards.get(board_type)
             if board is None:
                 await self._recreate_single(guild_id, board_type, None, generation, cfg)
