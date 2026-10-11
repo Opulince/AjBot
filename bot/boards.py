@@ -31,7 +31,7 @@ from datetime import datetime, timedelta
 import discord
 
 from bot.clock import Clock
-from bot.db.repo import BoardMessage, GuildConfig, RepostOp, RepostStatus, Repo, StaleRunError
+from bot.db.repo import DECIDED_STATUSES, BoardMessage, GuildConfig, RepostOp, RepostStatus, Repo, StaleRunError
 from bot.discord_ops import (
     RETRYABLE_ERRORS,
     DiscordOps,
@@ -42,7 +42,7 @@ from bot.discord_ops import (
     Presence,
     check_presence,
 )
-from bot.periods import ALLTIME, BOARD_ORDER, PeriodType, next_reset
+from bot.periods import ALLTIME, BOARD_ORDER, PeriodType, next_reset, period_before, period_containing
 from bot.ranking import Ranker
 from bot.ui.embeds import TOP_SHOWN, PreviousWinner, board_marker, build_board_embed, parse_board_marker
 from bot.ui.views import board_view
@@ -67,10 +67,21 @@ class BoardService:
 
     # --------------------------------------------------------------- render
 
-    async def _previous_winner(self, guild_id: int, board_type: str) -> PreviousWinner | None:
-        run = await self._repo.previous_result(guild_id, PeriodType(board_type))
-        if run is None:
+    async def _previous_winner(
+        self, guild_id: int, board_type: str, cfg: GuildConfig, now: datetime
+    ) -> PreviousWinner | None:
+        """Result of the period immediately before the current one, or ``None`` if it was never tracked.
+
+        A period is tracked when it ended after installation (see
+        ``ended_periods``). A tracked period whose run is missing or not yet
+        decided is reported as pending; an older result is never substituted.
+        """
+        period = period_before(period_containing(board_type, now))
+        if cfg.installed_at is None or period.end <= cfg.installed_at:
             return None
+        run = await self._repo.previous_result(guild_id, PeriodType(board_type), period.key)
+        if run is None or run.status not in DECIDED_STATUSES:
+            return PreviousWinner(period.key, None, None, None, pending=True)
         if run.winner_user_id is None:
             return PreviousWinner(run.period_key, None, None, None)
         member = await self._repo.get_member(guild_id, run.winner_user_id)
@@ -83,7 +94,7 @@ class BoardService:
     ) -> discord.Embed:
         now = self._clock.now()
         entries = await self._ranker.board_ranking(guild_id, board_type, now, limit=TOP_SHOWN)
-        previous = None if board_type == ALLTIME else await self._previous_winner(guild_id, board_type)
+        previous = None if board_type == ALLTIME else await self._previous_winner(guild_id, board_type, cfg, now)
         reset_at = None if board_type == ALLTIME else next_reset(board_type, now)
         return build_board_embed(
             guild_id=guild_id,

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Mapping, Sequence
 
 import discord
 
-from bot.periods import ALLTIME, unix_timestamp
+from bot.periods import ALLTIME, period_containing, unix_timestamp
 from bot.ranking import RankEntry, Standing
 
 TOP_SHOWN = 10
@@ -26,12 +26,24 @@ WINNER_TITLES = {
     "weekly": "Member of the Week",
     "monthly": "Member of the Month",
 }
-COLORS = {
-    "daily": 0x5865F2,
-    "weekly": 0x57F287,
-    "monthly": 0xFEE75C,
-    "alltime": 0xEB459E,
+PREVIOUS_LABELS = {
+    "daily": "Previous Member of the Day",
+    "weekly": "Previous Member of the Week",
+    "monthly": "Previous Member of the Month",
 }
+# One accent per board, all from the same tonal family so they read as a set.
+COLORS = {
+    "daily": 0xF97316,  # sunrise orange
+    "weekly": 0x3B82F6,  # blue
+    "monthly": 0x8B5CF6,  # violet
+    "alltime": 0xEAB308,  # hall-of-fame gold
+}
+BOARD_ICONS = {"daily": "☀️", "weekly": "📅", "monthly": "🌙", "alltime": "👑"}
+BOARD_AUTHOR = "Community Activity Championship"
+MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+PERIOD_NOUNS = {"daily": "day", "weekly": "week", "monthly": "month"}
+EMPTY_WHEN = {"daily": "today", "weekly": "this week", "monthly": "this month"}
+SCORING_NOTE = "1 message = 1 point"
 
 BOARD_MARKER_RE = re.compile(r"board:(\d+):(daily|weekly|monthly|alltime):(\d+)")
 
@@ -63,34 +75,101 @@ def plural(count: int, word: str = "message") -> str:
     return f"{count:,} {word}{'' if count == 1 else 's'}"
 
 
+def member_label(user_id: int, name: str | None, left: bool) -> str:
+    """Mention plus escaped plain-text name (readable even if the mention cannot resolve)."""
+    return f"<@{user_id}> · {safe_name(name)}{' (left)' if left else ''}"
+
+
 def entry_line(entry: RankEntry) -> str:
-    left = " (left)" if entry.left else ""
-    return f"**{entry.rank}.** <@{entry.user_id}> · {safe_name(entry.name)}{left} — **{plural(entry.count)}**"
+    """Row used by the ranks 11–100 pages."""
+    return f"**{entry.rank}.** {member_label(entry.user_id, entry.name, entry.left)} — **{plural(entry.count)}**"
+
+
+def board_line(entry: RankEntry) -> str:
+    """Row on a board: medal and bold count for the podium, a compact rank badge below it."""
+    who = member_label(entry.user_id, entry.name, entry.left)
+    medal = MEDALS.get(entry.rank)
+    if medal is not None:
+        return f"{medal} {who} — **{plural(entry.count)}**"
+    return f"`#{entry.rank}` {who} — {plural(entry.count)}"
+
+
+def scope_line(board_type: str, now: datetime) -> str:
+    """What the board is counting right now.
+
+    Period dates are spelled out as plain UTC text: a Discord timestamp would
+    render a UTC midnight as the previous day in western time zones.
+    """
+    if board_type == ALLTIME:
+        return "Standings across **all time** · never resets"
+    period = period_containing(board_type, now)
+    first = period.start
+    last = period.end - timedelta(days=1)
+    if board_type == "daily":
+        span = f"{first:%a} {first.day} {first:%b %Y}"
+    elif board_type == "weekly":
+        if first.year != last.year:
+            span = f"{first.day} {first:%b %Y} – {last.day} {last:%b %Y}"
+        elif first.month != last.month:
+            span = f"{first.day} {first:%b} – {last.day} {last:%b %Y}"
+        else:
+            span = f"{first.day}–{last.day} {last:%b %Y}"
+    else:
+        span = f"{first:%B %Y}"
+    return f"Standings for **{span}** (UTC)"
+
+
+def board_description(board_type: str, entries: Sequence[RankEntry], now: datetime) -> str:
+    top = list(entries[:TOP_SHOWN])
+    if not top:
+        when = EMPTY_WHEN.get(board_type)
+        suffix = f" {when}" if when else ""
+        return f"{scope_line(board_type, now)}\n\n*The podium is open — no messages counted yet{suffix}.*"
+    podium = [board_line(e) for e in top if e.rank in MEDALS]
+    rest = [board_line(e) for e in top if e.rank not in MEDALS]
+    blocks = [scope_line(board_type, now), "\n".join(podium), "\n".join(rest)]
+    return "\n\n".join(block for block in blocks if block)
 
 
 @dataclass(frozen=True)
 class PreviousWinner:
+    """Outcome of the period immediately before the current one.
+
+    ``pending`` means that period has ended but its result is not decided yet;
+    no winner is shown for it in the meantime.
+    """
+
     period_key: str
     user_id: int | None
     name: str | None
     count: int | None
     left: bool = False
+    pending: bool = False
 
     @property
     def empty(self) -> bool:
         return self.user_id is None
 
 
-def format_previous(previous: PreviousWinner | None) -> str:
+def format_previous(board_type: str, previous: PreviousWinner | None) -> str:
     if previous is None:
-        return "None yet"
+        return f"None yet — this is the first {PERIOD_NOUNS[board_type]} being tracked."
+    label = period_label(board_type, previous.period_key, is_test=False)
+    if previous.pending:
+        return f"*Tallying results…*\n{label}"
     if previous.empty:
-        return f"No eligible winner\n({previous.period_key})"
-    left = " (left)" if previous.left else ""
+        return f"No eligible winner\n{label}"
+    assert previous.user_id is not None
     return (
-        f"<@{previous.user_id}> · {safe_name(previous.name)}{left} — {plural(previous.count or 0)}\n"
-        f"({previous.period_key})"
+        f"🏆 {member_label(previous.user_id, previous.name, previous.left)}\n"
+        f"**{plural(previous.count or 0)}** · {label}"
     )
+
+
+def board_footer(guild_id: int, board_type: str, generation: int) -> str:
+    # The machine-readable recovery marker must stay in the footer, delimited by
+    # spaces (see has_marker); the embed timestamp renders right after "Last updated".
+    return f"{SCORING_NOTE} · {board_marker(guild_id, board_type, generation)} · Last updated"
 
 
 def build_board_embed(
@@ -104,24 +183,21 @@ def build_board_embed(
     banner_url: str | None,
     now: datetime,
 ) -> discord.Embed:
-    embed = discord.Embed(title=BOARD_TITLES[board_type], color=COLORS[board_type], timestamp=now)
-    top = list(entries[:TOP_SHOWN])
-    if top:
-        embed.description = "\n".join(entry_line(e) for e in top)
-    elif board_type == ALLTIME:
-        embed.description = "No messages counted yet."
-    else:
-        embed.description = "No messages yet this period."
+    embed = discord.Embed(
+        title=f"{BOARD_ICONS[board_type]} {BOARD_TITLES[board_type]}",
+        description=board_description(board_type, entries, now),
+        color=COLORS[board_type],
+        timestamp=now,
+    )
+    embed.set_author(name=BOARD_AUTHOR)
     if board_type != ALLTIME:
-        embed.add_field(name="Previous winner", value=format_previous(previous), inline=True)
+        embed.add_field(name=PREVIOUS_LABELS[board_type], value=format_previous(board_type, previous), inline=True)
         if next_reset is not None:
             ts = unix_timestamp(next_reset)
             embed.add_field(name="Next reset", value=f"<t:{ts}:R>\n<t:{ts}:f>", inline=True)
     if banner_url:
         embed.set_image(url=banner_url)
-    # The footer carries the machine-readable recovery marker next to the
-    # visible "last updated" label; the embed timestamp renders the time.
-    embed.set_footer(text=f"Last updated · {board_marker(guild_id, board_type, generation)}")
+    embed.set_footer(text=board_footer(guild_id, board_type, generation))
     return embed
 
 
