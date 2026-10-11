@@ -28,12 +28,13 @@ os.environ.pop("DISCORD_TOKEN", None)
 
 @pytest.fixture(autouse=True)
 def instant_retries(monkeypatch: pytest.MonkeyPatch) -> None:
-    """In-call Discord retries sleep for real in production; make them instant in tests."""
+    """In-call Discord retries and board-edit spacing sleep for real in production; skip them in tests."""
 
     async def no_sleep(_delay: float) -> None:
         return None
 
     monkeypatch.setattr("bot.discord_ops._retry_sleep", no_sleep)
+    monkeypatch.setattr("bot.boards._edit_pause", no_sleep)
 
 
 @pytest.fixture(autouse=True)

@@ -654,3 +654,22 @@ async def test_board_posted_with_the_old_footer_is_still_adopted(app: App, fake:
     assert adopted.embed is not None
     assert adopted.embed["title"] == "☀️ Daily Leaderboard"
     assert adopted.embed["footer"]["text"] == f"1 message = 1 point · board:{GUILD}:daily:1 · Last updated"
+
+
+async def test_board_edits_are_spaced_to_avoid_rate_limits(
+    app: App, fake: FakeDiscord, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The four in-place edits are separated by pauses, so they are not sent as one burst."""
+    from bot import boards as boards_module
+
+    await install(app)
+    events: list[str] = []
+
+    async def record_pause(delay: float) -> None:
+        events.append(f"pause:{delay}")
+
+    monkeypatch.setattr(boards_module, "_edit_pause", record_pause)
+    fake.on_call = lambda op: events.append("edit") if op == "edit_message" else None
+    await update(app)
+    gap = f"pause:{boards_module.EDIT_SPACING_SECONDS}"
+    assert events == ["edit", gap, "edit", gap, "edit", gap, "edit"]
