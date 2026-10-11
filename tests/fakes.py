@@ -107,8 +107,13 @@ class FakeMessage:
         return ((self.embed or {}).get("footer") or {}).get("text", "")
 
     @property
+    def links(self) -> tuple[str, ...]:
+        embed = self.embed or {}
+        return tuple(url for url in ((embed.get("author") or {}).get("url"), embed.get("url")) if url)
+
+    @property
     def board(self) -> tuple[int, str, int] | None:
-        return parse_board_marker(self.footer)
+        return next((m for m in map(parse_board_marker, (self.footer, *self.links)) if m), None)
 
 
 def _custom_ids(view: discord.ui.View | None) -> list[str]:
@@ -331,7 +336,7 @@ class FakeDiscord(DiscordOps):
         else:
             selected = msgs[-limit:]
         result = [
-            HistoryMessage(m.id, m.author_id, m.content, (m.footer,) if m.footer else (), m.created_at)
+            HistoryMessage(m.id, m.author_id, m.content, (m.footer,) if m.footer else (), m.created_at, m.links)
             for m in selected
         ]
         self._after("history")

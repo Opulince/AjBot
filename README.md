@@ -40,7 +40,7 @@ everything in a single SQLite file.
   Each board shows the top 10 (rank, mention, plain-text name, message count; medals for the top
   three), the UTC day, week or month it is counting, the previous period's winner (not on All-Time),
   the next reset as a Discord relative and absolute timestamp (not on All-Time), an optional banner
-  image and a "last updated" footer.
+  image and a "last updated" timestamp.
 - **Previous winner** fields are labelled *Previous Member of the Day / Week / Month* and always
   describe the period immediately before the current one, with its key: its winner and recorded
   count, "No eligible winner" if nobody qualified, or "Tallying results…" while that period's reset
@@ -368,7 +368,8 @@ discord.py internally retries a request after a lost response (5xx or connection
 returns the message it already created instead of making a second one.
 
 **Board reposts.** New boards are posted with a fresh generation marker `board:{guild}:{type}:{gen}`
-in the footer, and each new message ID is saved immediately. After a crash, the channel is scanned for
+in the link of the embed's author line (boards posted by older versions carry it in the footer; both
+are recognised), and each new message ID is saved immediately. After a crash, the channel is scanned for
 that generation's markers and any found are adopted. Old boards are deleted only after all four
 replacements exist, so the channel always has at least one working set of boards. Before finishing,
 untracked bot board messages from the same or older generations are deleted, so a rerun converges to

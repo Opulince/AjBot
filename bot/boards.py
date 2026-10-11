@@ -253,7 +253,7 @@ class BoardService:
         for msg in history:
             if msg.author_id != bot_id or msg.id in keep:
                 continue
-            parsed = next((m for m in map(parse_board_marker, (*msg.footers, msg.content)) if m), None)
+            parsed = next((m for m in map(parse_board_marker, msg.marker_texts) if m), None)
             if parsed is None or parsed[0] != guild_id or parsed[2] > max_generation:
                 continue
             try:
