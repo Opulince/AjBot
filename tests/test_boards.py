@@ -61,8 +61,8 @@ async def test_setup_posts_four_boards_in_order(app: App, fake: FakeDiscord) -> 
     assert [m.board for m in msgs] == [(GUILD, t, 1) for t in BOARD_ORDER]
     for m in msgs:
         assert m.components == [f"lb:more:{m.board[1]}"]
-        assert m.embed is not None
-        assert m.embed["footer"]["text"] == f"1 message = 1 point · board:{GUILD}:{m.board[1]}:1 · Last updated"
+        assert m.embed is not None and "footer" not in m.embed
+        assert m.embed["author"]["url"] == f"https://discord.com/channels/{GUILD}#board:{GUILD}:{m.board[1]}:1"
     cfg = await app.repo.get_guild_config(GUILD)
     assert cfg is not None and cfg.installed_at == T0
 
@@ -183,9 +183,8 @@ async def test_board_embed_contents(app: App, fake: FakeDiscord, clock: FakeCloc
     assert "<@11>" in fields["Previous Member of the Day"] and "2026-03-10" in fields["Previous Member of the Day"]
     ts = unix_timestamp(dt(2026, 3, 12))
     assert fields["Next reset"] == f"<t:{ts}:R>\n<t:{ts}:f>"
-    footer = daily["footer"]["text"]
-    assert parse_board_marker(footer) == (GUILD, "daily", boards["daily"].generation)
-    assert footer.startswith("1 message = 1 point · board:1:daily:") and footer.endswith(" · Last updated")
+    assert "footer" not in daily
+    assert parse_board_marker(daily["author"]["url"]) == (GUILD, "daily", boards["daily"].generation)
     assert daily["timestamp"] == clock.now().isoformat()
     alltime = by_type["alltime"]
     assert alltime is not None and alltime.get("fields", []) == []  # no previous winner, no reset countdown
@@ -653,7 +652,8 @@ async def test_board_posted_with_the_old_footer_is_still_adopted(app: App, fake:
     adopted = next(m for m in fake.board_messages(CHANNEL) if m.id == ids["daily"])
     assert adopted.embed is not None
     assert adopted.embed["title"] == "☀️ Daily Leaderboard"
-    assert adopted.embed["footer"]["text"] == f"1 message = 1 point · board:{GUILD}:daily:1 · Last updated"
+    assert "footer" not in adopted.embed
+    assert adopted.embed["author"]["url"] == f"https://discord.com/channels/{GUILD}#board:{GUILD}:daily:1"
 
 
 async def test_board_edits_are_spaced_to_avoid_rate_limits(

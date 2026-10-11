@@ -43,7 +43,7 @@ BOARD_AUTHOR = "Community Activity Championship"
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 PERIOD_NOUNS = {"daily": "day", "weekly": "week", "monthly": "month"}
 EMPTY_WHEN = {"daily": "today", "weekly": "this week", "monthly": "this month"}
-SCORING_NOTE = "1 message = 1 point"
+COUNT_EMOJI = "💬"  # shown after each count; a custom emoji works too, e.g. "<:chat:123456789012345678>"
 
 BOARD_MARKER_RE = re.compile(r"board:(\d+):(daily|weekly|monthly|alltime):(\d+)")
 
@@ -90,8 +90,8 @@ def board_line(entry: RankEntry) -> str:
     who = member_label(entry.user_id, entry.name, entry.left)
     medal = MEDALS.get(entry.rank)
     if medal is not None:
-        return f"{medal} {who} — **{plural(entry.count)}**"
-    return f"`#{entry.rank}` {who} — {plural(entry.count)}"
+        return f"{medal} {who} — **{plural(entry.count)}** {COUNT_EMOJI}"
+    return f"`#{entry.rank}` {who} — {plural(entry.count)} {COUNT_EMOJI}"
 
 
 def scope_line(board_type: str, now: datetime) -> str:
@@ -166,10 +166,15 @@ def format_previous(board_type: str, previous: PreviousWinner | None) -> str:
     )
 
 
-def board_footer(guild_id: int, board_type: str, generation: int) -> str:
-    # The machine-readable recovery marker must stay in the footer, delimited by
-    # spaces (see has_marker); the embed timestamp renders right after "Last updated".
-    return f"{SCORING_NOTE} · {board_marker(guild_id, board_type, generation)} · Last updated"
+def board_link(guild_id: int, board_type: str, generation: int) -> str:
+    """Author-line link carrying the machine-readable recovery marker.
+
+    Recovery reads it back from the embed (see ``HistoryMessage.marker_texts``),
+    so no visible footer is needed. It points at the server itself, so a click
+    just opens the server. Boards posted before this change keep the marker in
+    their footer, which recovery still reads.
+    """
+    return f"https://discord.com/channels/{guild_id}#{board_marker(guild_id, board_type, generation)}"
 
 
 def build_board_embed(
@@ -189,7 +194,7 @@ def build_board_embed(
         color=COLORS[board_type],
         timestamp=now,
     )
-    embed.set_author(name=BOARD_AUTHOR)
+    embed.set_author(name=BOARD_AUTHOR, url=board_link(guild_id, board_type, generation))
     if board_type != ALLTIME:
         embed.add_field(name=PREVIOUS_LABELS[board_type], value=format_previous(board_type, previous), inline=True)
         if next_reset is not None:
@@ -197,7 +202,6 @@ def build_board_embed(
             embed.add_field(name="Next reset", value=f"<t:{ts}:R>\n<t:{ts}:f>", inline=True)
     if banner_url:
         embed.set_image(url=banner_url)
-    embed.set_footer(text=board_footer(guild_id, board_type, generation))
     return embed
 
 
