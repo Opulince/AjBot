@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import discord
 import pytest
 
 from bot.clock import UTC
@@ -69,30 +70,54 @@ async def run_of(app: App, ptype: str, key: str) -> Any:
     return run
 
 
-async def assert_converged(app: App, fake: FakeDiscord) -> None:
-    """Invariants that must hold after recovery, whatever crashed where."""
+async def assert_converged(app: App, fake: FakeDiscord, *, legacy: int = 0) -> None:
+    """Invariants that must hold after recovery, whatever crashed where.
+
+    ``legacy`` is the number of announcements an older version posted before
+    the upgrade; they are adopted (recorded once), never reposted.
+    """
     runs = await app.repo.list_runs(GUILD)
     keys = [(r.period_type, r.period_key) for r in runs]
     assert len(keys) == len(set(keys)), "duplicate logical runs"
     assert all(r.terminal for r in runs), [(r.period_key, r.status) for r in runs if not r.terminal]
-    # Exactly one announcement per announced run, and its ID is the one recorded.
+    # Resets never post: the only non-board bot messages are adopted legacy announcements.
     footers = Counter(m.footer for m in fake.announcements(CHANNEL))
     assert all(n == 1 for n in footers.values()), footers
-    announced = [r for r in runs if r.announcement_message_id is not None]
-    assert len(announced) == len(footers)
-    for r in announced:
+    assert len(fake.announcements(CHANNEL)) == len(fake.bot_posts(CHANNEL)) == legacy
+    adopted = [r for r in runs if r.announcement_message_id is not None]
+    assert len(adopted) == legacy
+    for r in adopted:
         msgs = [m for m in fake.announcements(CHANNEL) if m.footer == reset_marker(GUILD, r.period_type.value, r.period_key)]
         assert [m.id for m in msgs] == [r.announcement_message_id]
-    # Exactly four boards, matching board_messages, below the latest announcement.
+    cfg = await app.repo.get_guild_config(GUILD)
+    assert cfg is not None and not cfg.repost_needed
+    # Exactly four boards, matching board_messages, in order.
     boards = await app.repo.get_board_messages(GUILD)
     msgs = fake.board_messages(CHANNEL)
     assert sorted(m.board[1] for m in msgs) == sorted(BOARD_ORDER), [m.board for m in msgs]
     assert {b.message_id for b in boards.values()} == {m.id for m in msgs}
     ids = [boards[t].message_id for t in BOARD_ORDER]
     assert ids == sorted(ids), "boards out of order"
-    if announced:
-        assert max(r.announcement_message_id for r in announced) < min(ids)
     assert await app.repo.get_active_repost(GUILD) is None
+
+
+async def legacy_mid_announce(app: App, fake: FakeDiscord, key: str, *, post: bool = True,
+                              channel_id: int = CHANNEL) -> int | None:
+    """Leave daily run ``key`` where an older version crashed mid-announce.
+
+    The run is COMPUTED with ``announce_started_at`` set and, with ``post``, the
+    old-style announcement (marker in the footer) already sits in the channel.
+    Returns that message's ID.
+    """
+    await app.runner.ensure_runs(GUILD)
+    run = await app.services.machine.compute(await run_of(app, "daily", key))
+    assert run.status is RunStatus.COMPUTED
+    now = app.services.clock.now()
+    await app.repo.update_run(run, now, announce_started_at=now, announcement_channel_id=channel_id)
+    if not post:
+        return None
+    embed = discord.Embed(title="Member of the Day").set_footer(text=reset_marker(GUILD, "daily", key))
+    return await fake.send_message(channel_id, content=f"**Member of the Day:** <@{run.winner_user_id}>", embed=embed)
 
 
 # ------------------------------------------------------------------ basic flow
@@ -109,14 +134,19 @@ async def test_daily_reset_full_flow(app: App, fake: FakeDiscord, clock: FakeClo
     assert run.status is RunStatus.DONE
     assert (run.winner_user_id, run.winner_count) == (11, 4)
     assert run.period_start == dt(2026, 3, 10) and run.period_end == dt(2026, 3, 11)
-    anns = fake.announcements(CHANNEL)
-    assert len(anns) == 1 and "Member of the Day" in anns[0].content and "<@11>" in anns[0].content
+    # Nothing is posted publicly: the winner shows up in the daily board's Previous field.
+    assert fake.announcements(CHANNEL) == [] and fake.bot_posts(CHANNEL) == []
+    assert run.announcement_message_id is None and run.announce_started_at is None
+    previous = fake.previous_field(CHANNEL, "daily")
+    assert "<@11>" in previous and "4 messages" in previous and "2026-03-10" in previous
     assert fake.holders_of(GUILD, ROLE_DAILY) == {11}
     holder = await app.repo.get_role_holder(GUILD, "daily")
     assert holder is not None and (holder.user_id, holder.since_key) == (11, "2026-03-10")
+    # The same four board messages were edited in place; no midnight repost.
     new_boards = {b.message_id for b in (await app.repo.get_board_messages(GUILD)).values()}
-    assert not (old_boards & new_boards)
-    assert not any(m.id in old_boards for m in fake.messages(CHANNEL))
+    assert new_boards == old_boards
+    assert fake.count("send_message") == 4 and fake.count("delete_message") == 0
+    assert await _repost_count(app) == 1  # only the one /setup made
     await assert_converged(app, fake)
 
 
@@ -190,10 +220,11 @@ async def test_winner_frozen_across_restart(config: Any, fake: FakeDiscord, cloc
     await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 3)
     await app.messages(GUILD, 12, dt(2026, 3, 10, 13), 1)
     clock.set(dt(2026, 3, 11, 0, 3))
-    fake.crash_before("send_message")  # crash right after the winner is computed
+    fake.crash_before("add_role")  # crash after the winner is computed, before any role change
     app, crashed = await tick_with_crash(app, config, fake, clock)
     assert crashed
-    assert (await run_of(app, "daily", "2026-03-10")).status is RunStatus.COMPUTED
+    run = await run_of(app, "daily", "2026-03-10")
+    assert run.status is RunStatus.ANNOUNCED and (run.winner_user_id, run.winner_count) == (11, 3)
     # Late-arriving counts for that day would change the ranking now...
     await app.messages(GUILD, 12, dt(2026, 3, 10, 23, 50), 10)
     await settle(app, clock)
@@ -223,29 +254,26 @@ async def _setup_two_day_world(tmp_path: Path) -> tuple[App, Any, FakeDiscord, F
     return app, config, fake, clock
 
 
-async def _assert_day2_final(app: App, fake: FakeDiscord) -> None:
+async def _assert_day2_final(app: App, fake: FakeDiscord, *, legacy: int = 0) -> None:
     run = await run_of(app, "daily", "2026-03-11")
     assert run.status is RunStatus.DONE and (run.winner_user_id, run.winner_count) == (12, 5)
     assert fake.holders_of(GUILD, ROLE_DAILY) == {12}
     holder = await app.repo.get_role_holder(GUILD, "daily")
     assert holder is not None and holder.user_id == 12
-    await assert_converged(app, fake)
+    await assert_converged(app, fake, legacy=legacy)
 
 
-async def test_crash_after_announcement_sent_before_id_committed(tmp_path: Path) -> None:
+async def test_legacy_mid_announce_crash_is_adopted_on_retry(tmp_path: Path) -> None:
+    """An older version posted the announcement, then died before recording it; this version adopts it."""
     app, config, fake, clock = await _setup_two_day_world(tmp_path)
-    fake.crash_after("send_message", 1)  # Discord accepted the announcement, SQLite never heard
-    app, crashed = await tick_with_crash(app, config, fake, clock)
-    assert crashed
-    run = await run_of(app, "daily", "2026-03-11")
-    assert run.status is RunStatus.COMPUTED and run.announce_started_at is not None
-    assert run.announcement_message_id is None
-    posted = [m for m in fake.announcements(CHANNEL) if "2026-03-11" in m.footer]
-    assert len(posted) == 1
+    posted = await legacy_mid_announce(app, fake, "2026-03-11")
+    app = await restart(app, config, fake, clock)  # the upgrade
+    sends = fake.count("send_message")
     await settle(app, clock)
     run = await run_of(app, "daily", "2026-03-11")
-    assert run.announcement_message_id == posted[0].id  # adopted, not reposted
-    await _assert_day2_final(app, fake)
+    assert run.announcement_message_id == posted  # adopted, not reposted
+    assert fake.count("send_message") == sends
+    await _assert_day2_final(app, fake, legacy=1)
     await app.shutdown()
 
 
@@ -280,7 +308,7 @@ async def test_crash_before_role_holders_updated(tmp_path: Path) -> None:
     await app.runner.ensure_runs(GUILD)
     run = await run_of(app, "daily", "2026-03-11")
     run = await machine.compute(run)
-    run = await machine.announce(run, public=True)
+    run = await machine.announce(run)
     assert run.status is RunStatus.ANNOUNCED
     # fetch winner, fetch previous, [add/remove], verify winner, verify previous -> crash at the last fetch
     fake.crash_after("fetch_member", 4)
@@ -297,30 +325,20 @@ async def test_crash_before_role_holders_updated(tmp_path: Path) -> None:
     await app.shutdown()
 
 
-async def test_crash_during_board_repost(tmp_path: Path) -> None:
-    app, config, fake, clock = await _setup_two_day_world(tmp_path)
-    # Mutations this tick: announcement, add_role, remove_role, then the repost sends.
-    fake.crash_after_mutation(5)  # after the 2nd replacement board is posted
-    app, crashed = await tick_with_crash(app, config, fake, clock)
-    assert crashed
-    op = await app.repo.get_active_repost(GUILD)
-    assert op is not None and len(op.new_ids) == 1  # second board posted but never recorded
-    await settle(app, clock)
-    await _assert_day2_final(app, fake)
-    await app.shutdown()
-
-
-# announcement, add_role, remove_role, 4 board sends, 4 old-board deletes
-RESET_MUTATIONS = 11
+# add_role, remove_role, then the four in-place board edits (no announcement, no repost)
+RESET_MUTATIONS = 6
 
 
 async def test_reset_tick_performs_expected_mutations(tmp_path: Path) -> None:
     """Guards the crash matrix below: it must cover every mutation of the reset tick."""
     app, config, fake, clock = await _setup_two_day_world(tmp_path)
-    before = sum(fake.count(op) for op in ("send_message", "edit_message", "delete_message", "add_role", "remove_role"))
+    ops = ("send_message", "edit_message", "delete_message", "add_role", "remove_role")
+    before = {op: fake.count(op) for op in ops}
     await app.runner.tick()
-    after = sum(fake.count(op) for op in ("send_message", "edit_message", "delete_message", "add_role", "remove_role"))
-    assert after - before == RESET_MUTATIONS
+    delta = {op: fake.count(op) - before[op] for op in ops}
+    assert delta == {"send_message": 0, "edit_message": 4, "delete_message": 0, "add_role": 1, "remove_role": 1}
+    assert sum(delta.values()) == RESET_MUTATIONS
+    assert "<@12>" in fake.previous_field(CHANNEL, "daily")
     await _assert_day2_final(app, fake)
     await app.shutdown()
 
@@ -354,7 +372,7 @@ async def test_repeated_restarts_until_done(tmp_path: Path) -> None:
         if not crashed:
             break
         crashes += 1
-    assert crashes >= 8
+    assert crashes >= 2  # add_role and remove_role; the board refresh only follows the compute tick
     await settle(app, clock)
     await _assert_day2_final(app, fake)
     await app.shutdown()
@@ -404,8 +422,8 @@ async def test_winner_left_before_role_assignment(app: App, fake: FakeDiscord, c
     await app.runner.ensure_runs(GUILD)
     run = await run_of(app, "daily", "2026-03-11")
     run = await machine.compute(run)
-    run = await machine.announce(run, public=True)
-    fake.remove_member(GUILD, 12)  # winner leaves between announcement and roles
+    run = await machine.announce(run)
+    fake.remove_member(GUILD, 12)  # winner leaves between the (silent) announce step and roles
     run = await machine.apply_roles(run)
     assert run.status is RunStatus.ROLES_DONE
     assert "winner left" in (run.last_error or "")
@@ -534,8 +552,8 @@ async def test_no_role_configured_completes_without_role_operations(app: App, fa
     clock.set(dt(2026, 3, 11, 0, 3))
     await app.runner.tick()
     run = await run_of(app, "daily", "2026-03-10")
-    assert run.status is RunStatus.DONE and run.announcement_message_id is not None
-    assert fake.count("add_role") == 0
+    assert run.status is RunStatus.DONE and run.announcement_message_id is None
+    assert fake.count("add_role") == 0 and fake.bot_posts(CHANNEL) == []
 
 
 async def test_deleted_reward_role_does_not_block(app: App, fake: FakeDiscord, clock: FakeClock) -> None:
@@ -568,11 +586,11 @@ async def test_catch_up_chronological_with_historical_winners(app: App, fake: Fa
         "2026-03-11": RunStatus.ROLES_SUPERSEDED,
         "2026-03-12": RunStatus.DONE,
     }
-    anns = fake.announcements(CHANNEL)
-    assert [a.footer for a in anns] == [reset_marker(GUILD, "daily", "2026-03-12")]
+    assert fake.bot_posts(CHANNEL) == []  # nothing announced, historical or latest
+    assert "<@13>" in fake.previous_field(CHANNEL, "daily")  # the latest period's winner
     assert fake.holders_of(GUILD, ROLE_DAILY) == {13}
     assert fake.count("add_role") == 1  # superseded runs never touched the role
-    assert await _repost_count(app) - reposts_before == 1  # one repost for the whole catch-up
+    assert await _repost_count(app) == reposts_before  # boards edited in place, never reposted
     await assert_converged(app, fake)
 
 
@@ -612,12 +630,11 @@ async def test_catch_up_daily_weekly_monthly_overlap(config: Any, fake: FakeDisc
     assert daily["2026-04-01"].winner_user_id == 14
     assert daily["2026-04-06"].winner_user_id == 15 and daily["2026-04-06"].status is RunStatus.DONE
     assert daily["2026-03-28"].status is RunStatus.SKIPPED_EMPTY
-    # Exactly the latest of each type was announced.
-    assert sorted(a.footer for a in fake.announcements(CHANNEL)) == sorted([
-        reset_marker(GUILD, "daily", "2026-04-06"),
-        reset_marker(GUILD, "weekly", "2026-W14"),
-        reset_marker(GUILD, "monthly", "2026-03"),
-    ])
+    # Nothing is announced; each board's Previous field shows the latest period of its type.
+    assert fake.bot_posts(CHANNEL) == []
+    assert "<@15>" in fake.previous_field(CHANNEL, "daily")
+    assert "<@13>" in fake.previous_field(CHANNEL, "weekly")
+    assert "<@12>" in fake.previous_field(CHANNEL, "monthly")
     assert fake.holders_of(GUILD, ROLE_DAILY) == {15}
     assert fake.holders_of(GUILD, ROLE_WEEKLY) == {13}
     assert fake.holders_of(GUILD, ROLE_MONTHLY) == {12}
@@ -638,30 +655,25 @@ async def test_empty_latest_period_keeps_latest_eligible_winner(app: App, fake: 
     assert fake.holders_of(GUILD, ROLE_DAILY) == {11}
 
 
-async def test_interrupted_historical_announcement_is_adopted_not_reposted(tmp_path: Path) -> None:
+async def test_interrupted_legacy_historical_announcement_is_adopted_not_reposted(tmp_path: Path) -> None:
     config, fake, clock = build_world(tmp_path)
     app = await App.start(config, fake, clock)
     await install(app)
     await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 3)
     clock.set(dt(2026, 3, 11, 0, 3))
-    fake.crash_after("send_message", 1)  # announcement posted, then the process died
-    app, crashed = await tick_with_crash(app, config, fake, clock)
-    assert crashed
+    posted = await legacy_mid_announce(app, fake, "2026-03-10")  # an older version posted, then died
+    app = await restart(app, config, fake, clock)
     # The bot stays offline for two more days.
     await app.messages(GUILD, 12, dt(2026, 3, 11, 13), 3)
     await app.messages(GUILD, 13, dt(2026, 3, 12, 13), 3)
     clock.set(dt(2026, 3, 13, 0, 5))
     await settle(app, clock)
     first = await run_of(app, "daily", "2026-03-10")
-    posted = [m for m in fake.announcements(CHANNEL) if "2026-03-10" in m.footer]
-    assert len(posted) == 1 and first.announcement_message_id == posted[0].id
+    assert first.announcement_message_id == posted
     assert first.status is RunStatus.ROLES_SUPERSEDED
-    assert [m.footer for m in fake.announcements(CHANNEL)] == [
-        reset_marker(GUILD, "daily", "2026-03-10"),
-        reset_marker(GUILD, "daily", "2026-03-12"),
-    ]
+    assert [m.footer for m in fake.announcements(CHANNEL)] == [reset_marker(GUILD, "daily", "2026-03-10")]
     assert fake.holders_of(GUILD, ROLE_DAILY) == {13}
-    await assert_converged(app, fake)
+    await assert_converged(app, fake, legacy=1)
     await app.shutdown()
 
 
@@ -720,12 +732,13 @@ async def test_force_reset_uses_test_key_and_real_flow(app: App, fake: FakeDisco
     await app.messages(GUILD, 12, dt(2026, 3, 10, 12, 30), 4)
     await app.messages(GUILD, 11, dt(2026, 3, 10, 12, 30), 2)
     clock.set(dt(2026, 3, 10, 18))
+    edits = fake.count("edit_message")
     run = await app.runner.force_reset(GUILD, "daily")
     assert run.is_test and run.period_key.startswith("test-2026-03-10-")
     assert run.status is RunStatus.DONE and (run.winner_user_id, run.winner_count) == (12, 4)
     assert run.period_start == dt(2026, 3, 10) and run.period_end == dt(2026, 3, 10, 18)
-    anns = fake.announcements(CHANNEL)
-    assert len(anns) == 1 and anns[0].content.startswith("[TEST]")
+    assert fake.bot_posts(CHANNEL) == []  # nothing public, not even a [TEST] post
+    assert fake.count("edit_message") == edits  # test runs never feed the boards
     assert fake.holders_of(GUILD, ROLE_DAILY) == {12}
     # No production run for the current period was created or touched.
     assert await app.repo.get_run_by_key(GUILD, "daily", "2026-03-10") is None
@@ -755,14 +768,14 @@ async def test_force_reset_crash_is_recovered(tmp_path: Path) -> None:
     await install(app)
     await app.messages(GUILD, 11, dt(2026, 3, 10, 12, 30), 3)
     clock.set(dt(2026, 3, 10, 13))
-    fake.crash_after("send_message", 1)
+    fake.crash_after("add_role", 1)
     with pytest.raises(SimulatedCrash):
         await app.runner.force_reset(GUILD, "monthly")
     app = await restart(app, config, fake, clock)
     await settle(app, clock)
     runs = [r for r in await app.repo.list_runs(GUILD) if r.is_test]
     assert len(runs) == 1 and runs[0].status is RunStatus.DONE
-    assert len(fake.announcements(CHANNEL)) == 1
+    assert fake.bot_posts(CHANNEL) == []
     assert fake.holders_of(GUILD, ROLE_MONTHLY) == {11}
     await assert_converged(app, fake)
     await app.shutdown()
@@ -894,84 +907,60 @@ async def test_randomized_crashes_reach_the_same_final_state(tmp_path: Path, see
         assert clean["holders"][role] == expected, ptype
 
 
-# ------------------------------------------------ announcement recovery hardening
+# ---------------------------------------- legacy announcement recovery hardening
 
 
-async def test_busy_channel_announcement_crash_is_adopted(tmp_path: Path) -> None:
+async def test_busy_channel_legacy_announcement_is_adopted(tmp_path: Path) -> None:
     config, fake, clock = build_world(tmp_path)
     app = await App.start(config, fake, clock)
     await install(app)
     await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 3)
-    clock.set(dt(2026, 3, 10, 23, 50))
-    for _ in range(300):  # heavy chatter in the board channel right before the reset
+    clock.set(dt(2026, 3, 11, 0, 3))
+    posted = await legacy_mid_announce(app, fake, "2026-03-10")
+    for _ in range(300):  # heavy chatter in the board channel after the old post
         fake.add_user_message(CHANNEL)
         clock.advance(seconds=2)
-    clock.set(dt(2026, 3, 11, 0, 3))
-    fake.crash_after("send_message", 1)
-    app, crashed = await tick_with_crash(app, config, fake, clock)
-    assert crashed
+    app = await restart(app, config, fake, clock)
     await settle(app, clock)
-    assert len(fake.announcements(CHANNEL)) == 1
-    assert (await run_of(app, "daily", "2026-03-10")).announcement_message_id == fake.announcements(CHANNEL)[0].id
+    assert [m.id for m in fake.announcements(CHANNEL)] == [posted]
+    assert (await run_of(app, "daily", "2026-03-10")).announcement_message_id == posted
     await app.shutdown()
 
 
-async def test_recovery_window_follows_the_latest_send_attempt(tmp_path: Path) -> None:
-    """A failed first send must not anchor the scan window hours before a later successful one."""
-    config, fake, clock = build_world(tmp_path)
-    app = await App.start(config, fake, clock)
+@pytest.mark.parametrize("failure", ["forbidden", "network", "channel_gone"])
+async def test_failed_legacy_scan_resolves_silently_and_never_blocks(
+    app: App, fake: FakeDiscord, clock: FakeClock, failure: str
+) -> None:
+    """A legacy run whose old channel can't be scanned must not block roles (or anything else)."""
     await install(app)
     await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 3)
     clock.set(dt(2026, 3, 11, 0, 3))
-    fake.fail_next("send_message", OpForbidden("Missing Permissions", code=50013))
-    await app.runner.tick()
+    channel = 999 if failure == "channel_gone" else CHANNEL  # 999 does not exist: NotFound
+    await legacy_mid_announce(app, fake, "2026-03-10", post=False, channel_id=channel)
+    if failure == "forbidden":
+        fake.forbidden_history.add(CHANNEL)
+    elif failure == "network":
+        fake.fail_next("history", OpNetwork("timeout"))
+    await app.runner.tick()  # one tick: no backoff, no retry loop
     run = await run_of(app, "daily", "2026-03-10")
-    assert run.status is RunStatus.COMPUTED and run.announce_started_at == dt(2026, 3, 11, 0, 3)
-    for _ in range(1200):  # chat keeps flowing while the permission is broken
-        fake.add_user_message(CHANNEL)
-        clock.advance(seconds=5)
-    clock.set(max(clock.now(), run.next_attempt_at) + timedelta(seconds=1))
-    fake.crash_after("send_message", 1)  # the retry posts, then the process dies
-    app, crashed = await tick_with_crash(app, config, fake, clock)
-    assert crashed
-    await settle(app, clock)
-    assert len(fake.announcements(CHANNEL)) == 1
-    await app.shutdown()
-
-
-async def test_unreadable_old_channel_does_not_block_moved_announcement(app: App, fake: FakeDiscord, clock: FakeClock) -> None:
-    from bot.commands.admin import setup_guild
-
-    await install(app)
-    await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 3)
-    clock.set(dt(2026, 3, 11, 0, 3))
-    fake.fail_next("send_message", OpForbidden("Missing Access", code=50001))
-    await app.runner.tick()
-    run = await run_of(app, "daily", "2026-03-10")
-    assert run.status is RunStatus.COMPUTED and run.announcement_channel_id == CHANNEL
-    fake.forbidden_history.add(CHANNEL)  # the bot can no longer read the old channel
-    fake.add_channel(200)
-    await setup_guild(app.services, GUILD, 200)  # the admin moves the leaderboard
-    clock.set(run.next_attempt_at + timedelta(seconds=1))
-    await app.runner.tick()
-    run = await run_of(app, "daily", "2026-03-10")
-    assert run.status is RunStatus.DONE and run.announcement_channel_id == 200
-    assert len(fake.announcements(200)) == 1
+    assert run.status is RunStatus.DONE and run.attempts == 0
+    assert run.announcement_message_id is None
     assert fake.holders_of(GUILD, ROLE_DAILY) == {11}
+    assert fake.bot_posts(CHANNEL) == []
 
 
-async def test_unreadable_old_channel_does_not_block_silent_catch_up(app: App, fake: FakeDiscord, clock: FakeClock) -> None:
+async def test_legacy_repost_flag_is_still_honoured_once(app: App, fake: FakeDiscord, clock: FakeClock) -> None:
+    """A database from an older version may still carry repost_needed=1; it is finished, then cleared."""
     await install(app)
-    await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 3)
-    clock.set(dt(2026, 3, 11, 0, 3))
-    fake.fail_next("send_message", OpForbidden("Missing Access", code=50001))
+    old = {b.message_id for b in (await app.repo.get_board_messages(GUILD)).values()}
+    async with app.services.db.transaction() as conn:
+        await conn.execute("UPDATE guild_config SET repost_needed = 1 WHERE guild_id = ?", (GUILD,))
     await app.runner.tick()
-    fake.forbidden_history.add(CHANNEL)
-    clock.set(dt(2026, 3, 12, 0, 5))  # Mar 11 is empty; Mar 10 is now historical
-    await app.runner.tick()
-    run = await run_of(app, "daily", "2026-03-10")
-    assert run.status is RunStatus.DONE and run.announcement_message_id is None  # recorded silently
-    assert fake.holders_of(GUILD, ROLE_DAILY) == {11}  # still the latest eligible winner
+    new = {b.message_id for b in (await app.repo.get_board_messages(GUILD)).values()}
+    assert not (old & new)
+    await assert_converged(app, fake)
+    await app.runner.tick()  # flag cleared: no further reposts
+    assert {b.message_id for b in (await app.repo.get_board_messages(GUILD)).values()} == new
 
 
 async def test_stale_forced_test_run_is_closed_without_a_winner(app: App, fake: FakeDiscord, clock: FakeClock) -> None:
@@ -989,7 +978,7 @@ async def test_stale_forced_test_run_is_closed_without_a_winner(app: App, fake: 
     run = await app.repo.get_run(run.id)
     assert run is not None and run.status is RunStatus.SKIPPED_EMPTY and run.winner_user_id is None
     assert "stale" in (run.last_error or "")
-    assert fake.announcements(CHANNEL) == [] and fake.holders_of(GUILD, ROLE_DAILY) == set()
+    assert fake.bot_posts(CHANNEL) == [] and fake.holders_of(GUILD, ROLE_DAILY) == set()
     assert "stale" in describe_forced_run(run).lower()
 
 
