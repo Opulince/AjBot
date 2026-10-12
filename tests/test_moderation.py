@@ -725,11 +725,12 @@ async def _mod_tree(services: Any) -> tuple[discord.Client, Any]:
 
 EXPECTED_PERMS = {
     "timeout": ("moderate_members",), "untimeout": ("moderate_members",), "warn": ("moderate_members",),
+    "mute": ("moderate_members",), "unmute": ("moderate_members",),
     "warnings": ("moderate_members",), "clearwarn": ("moderate_members",), "clearwarns": ("moderate_members",),
     "kick": ("kick_members",), "ban": ("ban_members",), "unban": ("ban_members",),
     "purge": ("manage_messages", "read_message_history"), "modlog": ("manage_guild",),
 }
-BOT_CHECKED = {"timeout", "untimeout", "kick", "ban", "unban", "purge"}
+BOT_CHECKED = {"timeout", "untimeout", "mute", "unmute", "kick", "ban", "unban", "purge"}
 
 
 async def test_moderation_commands_are_gated_twice(app: App) -> None:
@@ -1594,5 +1595,27 @@ async def test_gate_blocks_a_real_slash_command_before_it_runs(staff: App, fake:
         insider.permissions = discord.Permissions(kick_members=True)
         insider.app_permissions = discord.Permissions(kick_members=True)
         assert await kick._check_can_run(insider) is True  # type: ignore[union-attr]
+    finally:
+        await client.close()
+
+
+async def test_mute_and_unmute_are_timeout_aliases(staff: App, fake: FakeDiscord, clock: Any) -> None:
+    client, tree = await _mod_tree(staff.services)
+    try:
+        muted = _interaction()
+        await tree.get_command("mute").callback(muted, SimpleNamespace(id=TARGET), "10m", "spam")  # type: ignore[union-attr]
+        assert "timed out until" in muted.followups[0]
+        assert fake.guilds[GUILD].members[TARGET].timeout_until == clock.now() + timedelta(minutes=10)
+        bad = _interaction()
+        await tree.get_command("mute").callback(bad, SimpleNamespace(id=TARGET), "forever", None)  # type: ignore[union-attr]
+        assert "Use a duration like" in bad.response.sent[0]
+        refused = _interaction()
+        await tree.get_command("mute").callback(refused, SimpleNamespace(id=OWNER), "10m", None)  # type: ignore[union-attr]
+        assert "server owner" in refused.followups[0]  # same safety rules
+        unmuted = _interaction()
+        await tree.get_command("unmute").callback(unmuted, SimpleNamespace(id=TARGET), None)  # type: ignore[union-attr]
+        assert "Removed the timeout" in unmuted.followups[0]
+        assert fake.guilds[GUILD].members[TARGET].timeout_until is None
+        assert [c[1] for c in await cases(staff)] == ["timeout", "untimeout"]
     finally:
         await client.close()

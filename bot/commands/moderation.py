@@ -210,6 +210,32 @@ def register_moderation_commands(tree: app_commands.CommandTree, services: "Serv
             interaction, lambda: mod.untimeout(services, interaction.guild_id, actor_of(interaction), user.id, reason)
         )
 
+    # /mute and /unmute are the same as /timeout and /untimeout (Discord's timeout is its mute).
+
+    @tree.command(name="mute", description="Mute a member (a Discord timeout: no chat, reactions or voice)")
+    @app_commands.describe(
+        user="Member to mute",
+        duration="How long: 30s, 10m, 2h, 7d, 1h30m … (max 28d)",
+        reason="Shown in the mod log and the Audit Log",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(moderate_members=True)
+    @app_commands.checks.has_permissions(moderate_members=True)
+    @app_commands.checks.bot_has_permissions(moderate_members=True)
+    async def mute_cmd(
+        interaction: discord.Interaction, user: discord.Member, duration: str, reason: Optional[Reason] = None
+    ) -> None:
+        await timeout_cmd.callback(interaction, user, duration, reason)
+
+    @tree.command(name="unmute", description="Unmute a member (ends their timeout)")
+    @app_commands.describe(user="Member to unmute", reason="Shown in the mod log and the Audit Log")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(moderate_members=True)
+    @app_commands.checks.has_permissions(moderate_members=True)
+    @app_commands.checks.bot_has_permissions(moderate_members=True)
+    async def unmute_cmd(interaction: discord.Interaction, user: discord.Member, reason: Optional[Reason] = None) -> None:
+        await untimeout_cmd.callback(interaction, user, reason)
+
     # ------------------------------------------------------------ warnings
 
     @tree.command(name="warn", description="Warn a member (recorded as a case; they get a DM if possible)")
@@ -269,7 +295,7 @@ def register_moderation_commands(tree: app_commands.CommandTree, services: "Serv
             interaction, lambda: mod.kick(services, interaction.guild_id, actor_of(interaction), user.id, reason)
         )
 
-    @tree.command(name="ban", description="Ban a user (they don't have to be in the server)")
+    @tree.command(name="ban", description="Ban a user, optionally for a limited time")
     @app_commands.describe(
         user="User to ban",
         reason="Shown in the mod log and the Audit Log",

@@ -351,6 +351,7 @@ action as the bot, the bot's own permission is checked up front too. Replies are
 |---|---|---|
 | `/timeout user duration [reason]` | Timeout Members | Times a member out. Durations like `30s`, `10m`, `2h`, `7d`, `1h30m`; at most 28 days (Discord's limit). |
 | `/untimeout user [reason]` | Timeout Members | Ends a member's timeout. |
+| `/mute user duration [reason]` · `/unmute user [reason]` | Timeout Members | Same as `/timeout` and `/untimeout` (Discord's timeout is its mute). |
 | `/warn user reason` | Timeout Members | Records a warning as a case and DMs the member (if their DMs are closed, the warning still counts). May trigger an automatic timeout (below). |
 | `/warnings user` | Timeout Members | Lists the user's active warnings with case numbers. |
 | `/clearwarn case_id` · `/clearwarns user` | Timeout Members | Clears one or all warnings. They stop counting but stay in the case history. |
