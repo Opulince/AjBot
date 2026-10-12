@@ -29,6 +29,7 @@ from bot.boards import BoardService
 from bot.clock import Clock, SystemClock
 from bot.commands.admin import register_admin_commands
 from bot.commands.moderation import register_moderation_commands
+from bot.commands.staff import apply_staff_gate
 from bot.commands.stats import register_stats_command
 from bot.config import Config, ConfigError, load_config, prepare_storage
 from bot.counting.buffer import CountBuffer
@@ -217,6 +218,8 @@ class LeaderboardBot(discord.Client):
         register_admin_commands(self.tree, services)
         register_stats_command(self.tree, services)
         register_moderation_commands(self.tree, services)
+        gated = apply_staff_gate(self.tree, self.config.staff_role_ids)
+        log.info("Staff-only commands: %d (roles %s)", gated, ", ".join(map(str, self.config.staff_role_ids)) or "none")
         try:
             synced = await self.tree.sync()
             log.info("Synced %d application commands", len(synced))

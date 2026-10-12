@@ -224,7 +224,7 @@ async def test_setup_hook_initialises_database_items_commands_and_tasks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The real startup path, minus the network: DB init, DynamicItems, commands, tasks."""
-    config = make_config(tmp_path / "data")
+    config = make_config(tmp_path / "data", staff_role_ids=(1343413837101011047,))
     bot = LeaderboardBot(config)
 
     async def no_sync(*args: Any, **kwargs: Any) -> list[Any]:
@@ -238,6 +238,14 @@ async def test_setup_hook_initialises_database_items_commands_and_tasks(
         patterns = {p.pattern for p in bot._connection._view_store._dynamic_items}
         assert any(p.startswith("lb:more:") for p in patterns) and any(p.startswith("lb:pg:") for p in patterns)
         assert {c.name for c in bot.tree.get_commands()} >= {"setup", "stats", "exclude", "forcereset"}
+        # The staff-role gate is on every command except the public /stats.
+        assert all(
+            any(getattr(f, "__qualname__", "").startswith("staff_check") for f in c.checks)
+            for c in bot.tree.get_commands() if isinstance(c, app_commands.Command) and c.name != "stats"
+        )
+        assert not any(
+            getattr(f, "__qualname__", "").startswith("staff_check") for f in bot.tree.get_command("stats").checks
+        )
         tasks = (bot._flush_task, bot._scheduler_task, bot._board_task)
         assert all(t is not None and not t.done() for t in tasks)  # running (waiting for READY)
     assert not bot.db.connected

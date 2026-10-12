@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 import discord
 from discord import app_commands
 
+from bot.commands.staff import NotStaff
 from bot.db.repo import ResetRun, RunStatus
 from bot.discord_ops import RoleCheck
 from bot.periods import PeriodType
@@ -211,6 +212,8 @@ def describe_command_error(error: app_commands.AppCommandError) -> str | None:
             f"I'm missing the {permission_list(names)} permission{plural} here, so I can't do that. "
             "Ask an admin to grant it (server-wide or in this channel)."
         )
+    if isinstance(error, NotStaff):
+        return "Only staff can use this command."
     if isinstance(error, app_commands.NoPrivateMessage):
         return "This command only works inside a server."
     if isinstance(error, app_commands.CheckFailure):
