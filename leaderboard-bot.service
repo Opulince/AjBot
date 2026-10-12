@@ -1,0 +1,55 @@
+# systemd unit for the Discord leaderboard bot.
+#
+# Install (adjust the install directory and user if you use different ones):
+#   sudo useradd --system --home /opt/discord-leaderboard --shell /usr/sbin/nologin leaderboard
+#   sudo cp leaderboard-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now leaderboard-bot
+#
+# The database and logs live in systemd-managed directories:
+#   %S/discord-leaderboard  -> /var/lib/discord-leaderboard  (database)
+#   %L/discord-leaderboard  -> /var/log/discord-leaderboard  (rotating log files)
+
+[Unit]
+Description=Discord message leaderboard bot
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=leaderboard
+Group=leaderboard
+WorkingDirectory=/opt/discord-leaderboard
+Environment=PYTHONUNBUFFERED=1
+Environment=DB_PATH=%S/discord-leaderboard/leaderboard.db
+Environment=LOG_DIR=%L/discord-leaderboard
+# Holds DISCORD_TOKEN (and optional overrides). Values here take precedence.
+EnvironmentFile=/opt/discord-leaderboard/.env
+StateDirectory=discord-leaderboard
+LogsDirectory=discord-leaderboard
+ExecStart=/opt/discord-leaderboard/.venv/bin/python -m bot.main
+
+# Restart automatically after crashes, but not for errors only a human can fix
+# (exit 2 = invalid configuration, exit 3 = Discord rejected the token).
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=2 3
+
+# Graceful shutdown: SIGTERM triggers the final flush; allow time for it.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
