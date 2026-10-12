@@ -101,6 +101,7 @@ class FakeGuild:
     manage_roles: bool = True
     owner_id: int | None = None
     bans: dict[int, str] = field(default_factory=dict)  # user_id -> reason
+    name: str = "Test Server"
 
 
 @dataclass
@@ -534,6 +535,10 @@ class FakeDiscord(DiscordOps):
         )
         self._after("dm_user")
         return True
+
+    def guild_name(self, guild_id: int) -> str | None:
+        guild = self.guilds.get(guild_id)
+        return guild.name if guild is not None else None
 
 
 def make_config(tmp_path: Path, **overrides: Any) -> Config:

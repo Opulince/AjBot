@@ -992,3 +992,122 @@ async def test_prompt_forced_test_run_with_zero_grace_is_not_stale(tmp_path: Pat
     run = await app.runner.force_reset(GUILD, "weekly")
     assert run.status is RunStatus.DONE and run.winner_user_id == 11
     await app.shutdown()
+
+
+# -------------------------------------------------------------- winner DMs (G)
+
+
+async def _enable_winner_dm(app: App) -> None:
+    from bot.commands.admin import set_winner_dm
+
+    assert "on" in await set_winner_dm(app.services, GUILD, True)
+
+
+async def test_winner_dm_is_off_by_default(app: App, fake: FakeDiscord, clock: FakeClock) -> None:
+    await install(app)
+    await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 2)
+    clock.set(dt(2026, 3, 11, 0, 3))
+    await app.runner.tick()
+    run = await run_of(app, "daily", "2026-03-10")
+    assert run.status is RunStatus.DONE and run.winner_dm_sent_at is None and fake.dms == {}
+
+
+async def test_winner_dm_sent_once_for_the_latest_real_period(app: App, fake: FakeDiscord, clock: FakeClock) -> None:
+    await install(app)
+    await _enable_winner_dm(app)
+    await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 4)
+    clock.set(dt(2026, 3, 11, 0, 3))
+    await app.runner.tick()
+    run = await run_of(app, "daily", "2026-03-10")
+    assert run.status is RunStatus.DONE and run.winner_dm_sent_at == dt(2026, 3, 11, 0, 3)
+    [dm] = fake.dms[11]
+    assert dm["content"] == (
+        "Congratulations! You're the **Member of the Day** in **Test Server** for 2026-03-10 (UTC), with 4 messages."
+    )
+    await settle(app, clock)
+    assert fake.count("dm_user") == 1
+    assert fake.bot_posts(CHANNEL) == []  # still nothing public
+
+
+async def test_winner_dm_never_for_catch_up_or_forced_runs(app: App, fake: FakeDiscord, clock: FakeClock) -> None:
+    await install(app)
+    await _enable_winner_dm(app)
+    await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 3)
+    await app.messages(GUILD, 12, dt(2026, 3, 11, 13), 3)
+    await app.messages(GUILD, 13, dt(2026, 3, 12, 13), 3)
+    clock.set(dt(2026, 3, 13, 0, 5))  # offline across three boundaries
+    await app.runner.tick()
+    assert set(fake.dms) == {13}  # only the latest period's winner
+    clock.set(dt(2026, 3, 13, 12))
+    await app.messages(GUILD, 14, dt(2026, 3, 13, 11), 5)
+    run = await app.runner.force_reset(GUILD, "daily")
+    assert run.status is RunStatus.DONE and run.winner_user_id == 14
+    assert 14 not in fake.dms and run.winner_dm_sent_at is None
+
+
+@pytest.mark.parametrize("failure", ["closed", "network"])
+async def test_undeliverable_winner_dm_never_fails_or_retries(
+    app: App, fake: FakeDiscord, clock: FakeClock, failure: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    await install(app)
+    await _enable_winner_dm(app)
+    await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 2)
+    if failure == "closed":
+        fake.closed_dms.add(11)
+    else:
+        fake.fail_next("dm_user", OpNetwork("reset"), OpNetwork("reset"), OpNetwork("reset"))
+    clock.set(dt(2026, 3, 11, 0, 3))
+    caplog.set_level("INFO")
+    await app.runner.tick()
+    run = await run_of(app, "daily", "2026-03-10")
+    assert run.status is RunStatus.DONE and run.attempts == 0 and run.winner_dm_sent_at is not None
+    assert fake.holders_of(GUILD, ROLE_DAILY) == {11}
+    calls = fake.count("dm_user")
+    await settle(app, clock)
+    assert fake.count("dm_user") == calls  # never retried
+    if failure == "closed":
+        assert any("doesn't accept DMs" in r.getMessage() and r.levelname == "INFO" for r in caplog.records)
+
+
+async def test_winner_dm_is_not_delayed_by_a_failing_role_step(app: App, fake: FakeDiscord, clock: FakeClock) -> None:
+    await install(app)
+    await _enable_winner_dm(app)
+    fake.guilds[GUILD].roles[ROLE_DAILY].position = 150  # role step keeps failing
+    await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 2)
+    clock.set(dt(2026, 3, 11, 0, 3))
+    await app.runner.tick()
+    run = await run_of(app, "daily", "2026-03-10")
+    assert run.status is RunStatus.ANNOUNCED and run.next_attempt_at is not None  # backing off
+    assert len(fake.dms[11]) == 1
+
+
+@pytest.mark.parametrize("mode", ["before", "after"])
+async def test_crash_around_the_winner_dm(tmp_path: Path, mode: str) -> None:
+    """Crash before the DM: it's sent after the restart. Crash after it: sent at most once more."""
+    config, fake, clock = build_world(tmp_path)
+    app = await App.start(config, fake, clock)
+    await install(app)
+    await _enable_winner_dm(app)
+    await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 2)
+    clock.set(dt(2026, 3, 11, 0, 3))
+    (fake.crash_before if mode == "before" else fake.crash_after)("dm_user", 1)
+    app, crashed = await tick_with_crash(app, config, fake, clock)
+    assert crashed
+    run = await run_of(app, "daily", "2026-03-10")
+    assert run.status is RunStatus.ANNOUNCED and run.winner_dm_sent_at is None
+    await settle(app, clock)
+    run = await run_of(app, "daily", "2026-03-10")
+    assert run.status is RunStatus.DONE and run.winner_dm_sent_at is not None
+    assert len(fake.dms[11]) == (1 if mode == "before" else 2)  # the accepted double send
+    await assert_converged(app, fake)
+    await app.shutdown()
+
+
+async def test_winner_dm_toggle(app: App) -> None:
+    from bot.commands.admin import set_winner_dm
+
+    assert (await app.repo.get_guild_config(GUILD)) is None
+    assert "**on**" in await set_winner_dm(app.services, GUILD, True)
+    assert (await app.repo.get_guild_config(GUILD)).winner_dm  # type: ignore[union-attr]
+    assert "**off**" in await set_winner_dm(app.services, GUILD, False)
+    assert not (await app.repo.get_guild_config(GUILD)).winner_dm  # type: ignore[union-attr]

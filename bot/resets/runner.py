@@ -14,6 +14,11 @@ which board updates share):
 
    * the announcement step always resolves silently (see
      :meth:`bot.resets.machine.ResetMachine.announce`);
+   * while a run is ANNOUNCED, its winner gets a congratulation DM if the
+     server enabled ``/winnerdm`` and the run is real (not a forced test) and
+     the most recent ended period of its type, so catch-up after downtime
+     never DMs historical winners. Checked before any role backoff, so a
+     failing role step doesn't delay it;
    * a run's roles step waits while an earlier run of the same type has
      unfinished role work, so role changes happen in period order;
    * a run that never started role work is ``ROLES_SUPERSEDED`` when a later run
@@ -203,6 +208,15 @@ class ResetRunner:
         fresh = await self._repo.get_run(run.id)
         return fresh if fresh is not None else run
 
+    async def _wants_winner_dm(self, run: ResetRun) -> bool:
+        if run.is_test or run.winner_user_id is None or run.winner_dm_sent_at is not None:
+            return False
+        current = period_containing(run.period_type, self._clock.now())
+        if run.period_end != current.start:
+            return False  # a historical period (catch-up): no DM
+        cfg = await self._repo.get_guild_config(run.guild_id)
+        return cfg is not None and cfg.winner_dm
+
     async def _role_decision(self, run: ResetRun) -> str:
         """``apply``, ``supersede`` or ``wait``."""
         if run.role_started_at is None:
@@ -219,6 +233,8 @@ class ResetRunner:
         for _ in range(MAX_STEPS_PER_RUN):
             if run.terminal or run.status is RunStatus.PENDING:
                 return
+            if run.status is RunStatus.ANNOUNCED and await self._wants_winner_dm(run):
+                run = await self._step(self._machine.send_winner_dm, run)
             if self._machine.backing_off(run, self._clock.now()):
                 return
             before = run.status

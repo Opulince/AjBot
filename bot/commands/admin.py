@@ -135,6 +135,17 @@ async def set_banner(services: "Services", guild_id: int, url: str | None) -> No
         await services.boards.update_guild(guild_id)
 
 
+async def set_winner_dm(services: "Services", guild_id: int, enabled: bool) -> str:
+    await services.repo.set_winner_dm(guild_id, enabled, services.clock.now())
+    log.info("Winner DMs %s for guild %s", "enabled" if enabled else "disabled", guild_id)
+    if enabled:
+        return (
+            "Winner DMs are **on**: after each daily, weekly and monthly reset the winner gets a congratulation DM "
+            "(skipped quietly if their DMs are closed; never for /forcereset or for periods caught up after downtime)."
+        )
+    return "Winner DMs are **off**."
+
+
 def format_exclusion_list(lines: list[str], purged: int = 0, limit: int = 1900) -> str:
     """Whole-line list that never silently drops entries (Discord caps messages at 2000 chars)."""
     header = "Excluded:" if lines else "No channels or categories are excluded."
@@ -371,6 +382,15 @@ def register_admin_commands(tree: app_commands.CommandTree, services: "Services"
             await _reply(interaction, f"Forced test reset failed: {exc}")
             return
         await _reply(interaction, describe_forced_run(run))
+
+    @tree.command(name="winnerdm", description="DM each reset's winner a congratulation (default off)")
+    @app_commands.describe(state="on or off")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def winnerdm_cmd(interaction: discord.Interaction, state: Literal["on", "off"]) -> None:
+        assert interaction.guild_id is not None
+        await _reply(interaction, await set_winner_dm(services, interaction.guild_id, state == "on"))
 
     @tree.error
     async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:

@@ -21,6 +21,9 @@ States and transitions (every transition is persisted before moving on)::
   set) gets its channel scanned once for the marker ``reset:{guild}:{type}:{key}``
   so an already-posted announcement is adopted rather than orphaned; a scan
   that fails is logged and the step still resolves silently.
+  While a run is ANNOUNCED, the runner may also send the winner a
+  congratulation DM (``/winnerdm``); ``winner_dm_sent_at`` is recorded after
+  the attempt, so it is never retried (a crash in between can send it twice).
 * ROLES_DONE: the reward role is moved to the winner and verified against the
   actual Discord member roles before ``role_holders`` is updated (atomically
   with the status change). Every step is idempotent, so a crash between any two
@@ -37,6 +40,8 @@ import logging
 import random
 from datetime import datetime, timedelta
 
+import discord
+
 from bot.clock import Clock
 from bot.counting.buffer import CountBuffer
 from bot.db.repo import Repo, ResetRun, RunStatus
@@ -50,7 +55,7 @@ from bot.discord_ops import (
     with_retries,
 )
 from bot.ranking import Ranker
-from bot.ui.embeds import reset_marker
+from bot.ui.embeds import PERIOD_NOUNS, period_label, plural, reset_marker
 
 log = logging.getLogger(__name__)
 
@@ -207,6 +212,36 @@ class ResetMachine:
             log.info("Reset %s adopted existing announcement message %s", run.describe(), found)
         log.info("Reset %s transition COMPUTED -> ANNOUNCED (silent)", run.describe())
         return updated
+
+    # ----------------------------------------------------------- winner DM
+
+    async def send_winner_dm(self, run: ResetRun) -> ResetRun:
+        """Best-effort congratulation DM to the winner, attempted at most once per run.
+
+        Closed DMs and Discord errors are logged and never fail or retry the
+        run: the attempt is recorded either way.
+        """
+        if run.status is not RunStatus.ANNOUNCED or run.winner_dm_sent_at is not None or run.winner_user_id is None:
+            return run
+        winner = run.winner_user_id
+        noun = PERIOD_NOUNS[run.period_type.value].title()
+        server = self._ops.guild_name(run.guild_id)
+        where = f" in **{discord.utils.escape_markdown(server)}**" if server else ""
+        text = (
+            f"Congratulations! You're the **Member of the {noun}**{where} for "
+            f"{period_label(run.period_type.value, run.period_key, run.is_test)}, with {plural(run.winner_count or 0)}."
+        )
+        try:
+            delivered = await with_retries(lambda: self._ops.dm_user(winner, content=text), name="winner_dm")
+        except OpError as exc:
+            log.warning("Reset %s: winner DM to %s failed: %s", run.describe(), winner, exc.describe())
+        else:
+            if delivered:
+                log.info("Reset %s: winner %s was sent a DM", run.describe(), winner)
+            else:
+                log.info("Reset %s: winner %s doesn't accept DMs; skipped", run.describe(), winner)
+        now = self._clock.now()
+        return await self._repo.update_run(run, now, winner_dm_sent_at=now)
 
     # --------------------------------------------------------------- roles
 
