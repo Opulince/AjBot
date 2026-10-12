@@ -16,7 +16,6 @@ from bot.ui.embeds import (
     COLORS,
     PreviousWinner,
     board_marker,
-    build_announcement,
     build_board_embed,
     build_page_embed,
     entry_line,
@@ -250,16 +249,17 @@ def test_worst_case_board_stays_within_discord_limits(board_type: str) -> None:
 # ------------------------------------------- other embeds are left as they were
 
 
-def test_pages_and_announcements_keep_their_format() -> None:
+def test_pages_keep_their_format() -> None:
     row = entry(11, user_id=42, count=5, name="Alice", left=True)
     assert entry_line(row) == "**11.** <@42> · Alice (left) — **5 messages**"
     page = build_page_embed(board_type="daily", entries=[row], page=1, pages=1, now=NOW)
     assert page.title == "Daily Leaderboard — ranks 11–11"
     assert page.footer.text == "Page 1/1 · ranks 11–100"
-    content, announcement = build_announcement(
-        guild_id=GUILD, period_type="daily", period_key="2026-03-09", winner_id=42, winner_name="Alice",
-        count=3, is_test=False,
-    )
-    assert content == "**Member of the Day:** <@42> — 3 messages"
-    assert announcement.title == "Member of the Day"
-    assert announcement.footer.text == "reset:1:daily:2026-03-09"
+
+
+def test_announcement_builders_are_gone() -> None:
+    """Winners live in the boards' "Previous …" field; there is no separate announcement post."""
+    import bot.ui.embeds as embeds
+
+    assert not hasattr(embeds, "build_announcement") and not hasattr(embeds, "WINNER_TITLES")
+    assert embeds.reset_marker(GUILD, "daily", "2026-03-09") == "reset:1:daily:2026-03-09"  # legacy adoption

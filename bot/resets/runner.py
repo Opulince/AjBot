@@ -7,12 +7,13 @@ which board updates share):
    run (or since installation), with exact boundaries persisted. Existing runs
    are never recreated — the unique key prevents duplicates.
 2. Compute pass: PENDING runs that are due are computed in chronological order.
+   When a real run gets its result, the boards are edited in place right away so
+   the "Previous Member of …" field shows it without waiting for the next
+   periodic refresh. Nothing is posted publicly.
 3. Advance pass, chronological:
 
-   * announce publicly only if the run is the most recent ended period of its
-     type (forced test runs: if nothing newer of that type exists); older runs
-     are recorded silently, but an announcement that *may* already have been
-     posted is always resolved by scanning for its marker first;
+   * the announcement step always resolves silently (see
+     :meth:`bot.resets.machine.ResetMachine.announce`);
    * a run's roles step waits while an earlier run of the same type has
      unfinished role work, so role changes happen in period order;
    * a run that never started role work is ``ROLES_SUPERSEDED`` when a later run
@@ -21,13 +22,13 @@ which board updates share):
      work always finish it;
    * forced test runs never supersede real runs.
 
-4. Board repost: at most one repost per tick, after all announcements.
+4. Board repost: only finishes a repost that is already in progress, or one a
+   legacy ``repost_needed`` flag still requests. Resets never request one.
 """
 
 from __future__ import annotations
 
 import asyncio
-import functools
 import logging
 from typing import Awaitable, Callable
 
@@ -136,6 +137,7 @@ class ResetRunner:
         await self._enumerate(cfg)
 
         computed = 0
+        decided = False
         for run in await self._repo.open_runs(guild_id):
             now = self._clock.now()
             if run.status is not RunStatus.PENDING or self._machine.backing_off(run, now):
@@ -145,11 +147,19 @@ class ResetRunner:
             if computed >= COMPUTE_BATCH:
                 log.info("Guild %s: compute batch limit reached; continuing next tick", guild_id)
                 break
-            await self._step(self._machine.compute, run)
+            result = await self._step(self._machine.compute, run)
             computed += 1
+            if not run.is_test and result.status is not RunStatus.PENDING:
+                decided = True
 
         for run in await self._repo.open_runs(guild_id):
             await self._advance(run)
+
+        if decided:
+            try:
+                await self._boards.update_guild(guild_id)
+            except Exception:
+                log.exception("Board refresh after a reset failed for guild %s", guild_id)
 
         try:
             await self._boards.reconcile(guild_id)
@@ -193,13 +203,6 @@ class ResetRunner:
         fresh = await self._repo.get_run(run.id)
         return fresh if fresh is not None else run
 
-    async def _should_announce(self, run: ResetRun) -> bool:
-        if run.is_test:
-            later = await self._repo.later_run_summary(run, real_only=False)
-            return later.total == 0
-        current = period_containing(run.period_type, self._clock.now())
-        return run.period_end == current.start
-
     async def _role_decision(self, run: ResetRun) -> str:
         """``apply``, ``supersede`` or ``wait``."""
         if run.role_started_at is None:
@@ -220,8 +223,7 @@ class ResetRunner:
                 return
             before = run.status
             if run.status is RunStatus.COMPUTED:
-                public = await self._should_announce(run)
-                run = await self._step(functools.partial(self._machine.announce, public=public), run)
+                run = await self._step(self._machine.announce, run)
             elif run.status is RunStatus.ANNOUNCED:
                 decision = await self._role_decision(run)
                 if decision == "wait":

@@ -218,15 +218,21 @@ async def test_membership_audit_marks_departed_top_users(app: App, fake: FakeDis
 # ------------------------------------------------------------- reposting
 
 
-async def test_announcement_sits_above_all_boards_after_reset(app: App, fake: FakeDiscord, clock: FakeClock) -> None:
+async def test_reset_edits_boards_in_place_without_announcement_or_repost(
+    app: App, fake: FakeDiscord, clock: FakeClock
+) -> None:
     await install(app)
+    before = await assert_four_boards(app, fake)
     await app.messages(GUILD, 11, dt(2026, 3, 10, 13), 1)
     clock.set(dt(2026, 3, 11, 0, 3))
     await app.runner.tick()
     ids = await assert_four_boards(app, fake)
-    announcement = fake.announcements(CHANNEL)[0]
-    assert announcement.id < min(ids.values())
-    assert [m.id for m in fake.messages(CHANNEL)] == [announcement.id] + [ids[t] for t in BOARD_ORDER]
+    assert ids == before  # same messages, edited in place
+    assert [m.id for m in fake.messages(CHANNEL)] == [ids[t] for t in BOARD_ORDER]  # nothing else posted
+    assert fake.announcements(CHANNEL) == []
+    cfg = await app.repo.get_guild_config(GUILD)
+    assert cfg is not None and not cfg.repost_needed
+    assert "<@11>" in fake.previous_field(CHANNEL, "daily")
 
 
 async def _start_repost(app: App) -> None:

@@ -13,19 +13,22 @@ States and transitions (every transition is persisted before moving on)::
   member confirmed to still be in the guild is found. The winner is frozen.
   Unknown membership (network errors, rate limits, Forbidden) aborts and
   retries — it never disqualifies anyone.
-* ANNOUNCED: the announcement step is resolved. ``announce_started_at`` is
-  persisted before sending; on retry the channel is scanned for the marker
-  ``reset:{guild}:{type}:{key}`` and an existing message is adopted, closing the
-  "Discord accepted it but SQLite never heard" window. Historical (superseded)
-  runs are recorded silently and ``announcement_message_id`` stays NULL.
+* ANNOUNCED: the announcement step is resolved (always silent). Winners are
+  shown in the boards' "Previous Member of …" field instead of a public post,
+  so nothing is sent and ``announcement_message_id`` stays NULL. The state
+  name is kept because it is part of the ``reset_runs`` CHECK constraint.
+  Legacy: a run that an older version left mid-announce (``announce_started_at``
+  set) gets its channel scanned once for the marker ``reset:{guild}:{type}:{key}``
+  so an already-posted announcement is adopted rather than orphaned; a scan
+  that fails is logged and the step still resolves silently.
 * ROLES_DONE: the reward role is moved to the winner and verified against the
   actual Discord member roles before ``role_holders`` is updated (atomically
   with the status change). Every step is idempotent, so a crash between any two
   Discord calls is repaired by simply running the step again.
 * DONE / SKIPPED_EMPTY / ROLES_SUPERSEDED are terminal.
 
-Which runs announce publicly and which may move roles is decided by the runner
-(see :mod:`bot.resets.runner`); this module executes single transitions.
+Which runs may move roles is decided by the runner (see
+:mod:`bot.resets.runner`); this module executes single transitions.
 """
 
 from __future__ import annotations
@@ -38,7 +41,6 @@ from bot.clock import Clock
 from bot.counting.buffer import CountBuffer
 from bot.db.repo import Repo, ResetRun, RunStatus
 from bot.discord_ops import (
-    RETRYABLE_ERRORS,
     DiscordOps,
     OpError,
     OpNotFound,
@@ -48,7 +50,7 @@ from bot.discord_ops import (
     with_retries,
 )
 from bot.ranking import Ranker
-from bot.ui.embeds import build_announcement, reset_marker
+from bot.ui.embeds import reset_marker
 
 log = logging.getLogger(__name__)
 
@@ -183,75 +185,27 @@ class ResetMachine:
                 return msg.id
         return None
 
-    async def announce(self, run: ResetRun, *, public: bool) -> ResetRun:
+    async def announce(self, run: ResetRun) -> ResetRun:
+        """Resolve the announcement step without posting anything (COMPUTED -> ANNOUNCED)."""
         if run.status is not RunStatus.COMPUTED:
             return run
-        now = self._clock.now()
-
+        found: int | None = None
         if run.announce_started_at is not None and run.announcement_channel_id is not None:
-            # A previous attempt may have posted before crashing: look first.
+            # Legacy: an older version may have posted before crashing. Adopt it so
+            # the run records the message; never post a new one.
             try:
                 found = await self._find_announcement(run, run.announcement_channel_id)
-            except OpNotFound:
-                found = None  # the channel itself is gone, and with it any announcement
-            except RETRYABLE_ERRORS as exc:
-                return await self.fail(run, "announce-scan", exc)
             except OpError as exc:
-                # Forbidden / bad request: the previous channel cannot be read.
-                cfg = await self._repo.get_guild_config(run.guild_id)
-                moved = cfg is not None and cfg.board_channel_id != run.announcement_channel_id
-                if public and not moved:
-                    return await self.fail(run, "announce-scan", exc)
                 log.warning(
-                    "Reset %s cannot scan channel %s for an earlier announcement (%s); %s",
+                    "Reset %s cannot scan channel %s for an earlier announcement (%s); resolving silently",
                     run.describe(),
                     run.announcement_channel_id,
                     exc.describe(),
-                    "continuing in the new channel" if public else "recording silently",
                 )
-                found = None
-            if found is not None:
-                log.info("Reset %s adopted existing announcement message %s", run.describe(), found)
-                updated = await self._repo.mark_announced(
-                    run, now, channel_id=run.announcement_channel_id, message_id=found, repost_needed=True
-                )
-                log.info("Reset %s transition COMPUTED -> ANNOUNCED", run.describe())
-                return updated
-
-        if not public:
-            updated = await self._repo.mark_announced(run, now, channel_id=None, message_id=None, repost_needed=False)
-            log.info("Reset %s transition COMPUTED -> ANNOUNCED (silent: historical catch-up)", run.describe())
-            return updated
-
-        cfg = await self._repo.get_guild_config(run.guild_id)
-        if cfg is None or cfg.board_channel_id is None:
-            return await self.fail(run, "announce", "no leaderboard channel configured")
-        channel_id = cfg.board_channel_id
-        # Any earlier attempt was just ruled out by the scan above, so the
-        # recovery window can start at this attempt.
-        run = await self._repo.update_run(run, now, announce_started_at=now, announcement_channel_id=channel_id)
-
-        assert run.winner_user_id is not None and run.winner_count is not None
-        member = await self._repo.get_member(run.guild_id, run.winner_user_id)
-        content, embed = build_announcement(
-            guild_id=run.guild_id,
-            period_type=run.period_type.value,
-            period_key=run.period_key,
-            winner_id=run.winner_user_id,
-            winner_name=(member.display_name or member.username) if member else None,
-            count=run.winner_count,
-            is_test=run.is_test,
-        )
-        try:
-            message_id = await self._ops.send_message(
-                channel_id, content=content, embed=embed, mention_user_ids=[run.winner_user_id]
-            )
-        except OpError as exc:
-            return await self.fail(run, "announce-send", exc)
-        updated = await self._repo.mark_announced(
-            run, self._clock.now(), channel_id=channel_id, message_id=message_id, repost_needed=True
-        )
-        log.info("Reset %s transition COMPUTED -> ANNOUNCED (message %s)", run.describe(), message_id)
+        updated = await self._repo.mark_announced(run, self._clock.now(), message_id=found)
+        if found is not None:
+            log.info("Reset %s adopted existing announcement message %s", run.describe(), found)
+        log.info("Reset %s transition COMPUTED -> ANNOUNCED (silent)", run.describe())
         return updated
 
     # --------------------------------------------------------------- roles
