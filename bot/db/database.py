@@ -22,12 +22,14 @@ import aiosqlite
 log = logging.getLogger(__name__)
 
 _SCHEMA_FILE = Path(__file__).with_name("schema.sql")
+_MIGRATION_DIR = Path(__file__).parent
 
 
 def _load_migrations() -> list[tuple[int, str]]:
     """Ordered list of ``(version, sql)``. Append new migrations; never edit old ones."""
     return [
         (1, _SCHEMA_FILE.read_text(encoding="utf-8")),
+        (2, (_MIGRATION_DIR / "migration_002.sql").read_text(encoding="utf-8")),
     ]
 
 

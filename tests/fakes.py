@@ -34,14 +34,22 @@ from bot.discord_ops import (
     DiscordOps,
     HistoryMessage,
     MemberInfo,
+    MemberRank,
+    OpBadRequest,
     OpForbidden,
     OpNotFound,
+    PurgeResult,
     RoleCheck,
 )
 from bot.main import Services, build_services
 from bot.ui.embeds import parse_board_marker
 
-MUTATING_OPS = ("send_message", "edit_message", "delete_message", "add_role", "remove_role")
+MUTATING_OPS = (
+    "send_message", "edit_message", "delete_message", "add_role", "remove_role",
+    "timeout_member", "kick_member", "ban_user", "unban_user", "purge", "dm_user",
+)
+BOT_ROLE_ID = 1  # the bot's own top role, for hierarchy comparisons
+MAX_TIMEOUT = timedelta(days=28)
 
 
 class SimulatedCrash(BaseException):
@@ -73,6 +81,8 @@ class FakeMember:
     display_name: str
     username: str
     roles: set[int] = field(default_factory=set)
+    administrator: bool = False
+    timeout_until: datetime | None = None
 
 
 @dataclass
@@ -89,6 +99,8 @@ class FakeGuild:
     roles: dict[int, FakeRole] = field(default_factory=dict)
     bot_top_position: int = 100
     manage_roles: bool = True
+    owner_id: int | None = None
+    bans: dict[int, str] = field(default_factory=dict)  # user_id -> reason
 
 
 @dataclass
@@ -101,6 +113,7 @@ class FakeMessage:
     components: list[str]
     created_at: datetime
     edits: int = 0
+    pinned: bool = False
 
     @property
     def footer(self) -> str:
@@ -139,6 +152,8 @@ class FakeDiscord(DiscordOps):
         self.on_call: Callable[[str], Any] | None = None
         self.duplicate_next_send = False  # simulate a create that a transport retry repeated
         self.forbidden_history: set[int] = set()
+        self.dms: dict[int, list[dict[str, Any]]] = {}
+        self.closed_dms: set[int] = set()
 
     # ------------------------------------------------------------ fixtures
 
@@ -147,9 +162,12 @@ class FakeDiscord(DiscordOps):
         self.guilds[guild_id] = guild
         return guild
 
-    def add_member(self, guild_id: int, user_id: int, name: str | None = None, roles: tuple[int, ...] = ()) -> FakeMember:
+    def add_member(
+        self, guild_id: int, user_id: int, name: str | None = None, roles: tuple[int, ...] = (), *,
+        administrator: bool = False,
+    ) -> FakeMember:
         name = name or f"user{user_id}"
-        member = FakeMember(user_id, name, name.lower(), set(roles))
+        member = FakeMember(user_id, name, name.lower(), set(roles), administrator)
         self.guilds[guild_id].members[user_id] = member
         return member
 
@@ -164,9 +182,14 @@ class FakeDiscord(DiscordOps):
     def add_channel(self, channel_id: int) -> None:
         self.channels.setdefault(channel_id, [])
 
-    def add_user_message(self, channel_id: int, author_id: int = 4242, content: str = "chat") -> int:
+    def add_user_message(
+        self, channel_id: int, author_id: int = 4242, content: str = "chat", *, at: datetime | None = None,
+        pinned: bool = False,
+    ) -> int:
         """A normal member's message in a channel (e.g. chatter in the board channel)."""
-        msg = FakeMessage(self._new_id(), channel_id, author_id, content, None, [], self.clock.now())
+        created = ensure_utc(at) if at is not None else self.clock.now()
+        msg = FakeMessage(snowflake_at(created, next(self._seq)), channel_id, author_id, content, None, [], created,
+                          pinned=pinned)
         self.channels[channel_id].append(msg)
         return msg.id
 
@@ -411,6 +434,104 @@ class FakeDiscord(DiscordOps):
             raise OpNotFound("Unknown Channel", code=10003)
         self._after("resolve_channel")
         return info
+
+    # ---------------------------------------------------------- moderation
+
+    def _rank(self, guild: FakeGuild, user_id: int) -> MemberRank:
+        if user_id == self._bot_id:
+            return MemberRank(user_id, (guild.bot_top_position, -BOT_ROLE_ID), owner=False, administrator=True)
+        member = guild.members.get(user_id)
+        if member is None:
+            raise OpNotFound("404 Not Found (error code: 10007): Unknown Member", code=10007)
+        ranks = [(r.position, -r.role_id) for rid in member.roles if (r := guild.roles.get(rid)) is not None]
+        top = max(ranks, default=(0, -guild.guild_id))  # @everyone
+        owner = guild.owner_id == user_id
+        return MemberRank(user_id, top, owner=owner, administrator=member.administrator or owner,
+                          timed_out_until=member.timeout_until)
+
+    def _check_moderatable(self, guild: FakeGuild, user_id: int) -> None:
+        """Discord's own rule: nobody can act on the owner or on someone at/above the bot's top role."""
+        rank = self._rank(guild, user_id)
+        if rank.owner or rank.top_role >= self._rank(guild, self._bot_id).top_role:
+            raise OpForbidden("403 Forbidden (error code: 50013): Missing Permissions", code=50013)
+
+    async def member_rank(self, guild_id: int, user_id: int) -> MemberRank:
+        self._before("member_rank", guild_id, user_id)
+        rank = self._rank(self.guilds[guild_id], user_id)
+        self._after("member_rank")
+        return rank
+
+    async def timeout_member(self, guild_id: int, user_id: int, until: datetime | None, *, reason: str) -> None:
+        self._before("timeout_member", guild_id, user_id, until, reason)
+        guild = self.guilds[guild_id]
+        self._check_moderatable(guild, user_id)
+        member = guild.members[user_id]
+        if member.administrator and until is not None:
+            raise OpForbidden("403 Forbidden (error code: 50013): Missing Permissions", code=50013)
+        if until is not None and ensure_utc(until) > self.clock.now() + MAX_TIMEOUT:
+            raise OpBadRequest("400 Bad Request: communication_disabled_until is too far", code=50035)
+        member.timeout_until = ensure_utc(until) if until is not None else None
+        self._after("timeout_member")
+
+    async def kick_member(self, guild_id: int, user_id: int, *, reason: str) -> None:
+        self._before("kick_member", guild_id, user_id, reason)
+        guild = self.guilds[guild_id]
+        self._check_moderatable(guild, user_id)
+        del guild.members[user_id]
+        self._after("kick_member")
+
+    async def ban_user(self, guild_id: int, user_id: int, *, delete_message_seconds: int, reason: str) -> None:
+        self._before("ban_user", guild_id, user_id, delete_message_seconds, reason)
+        guild = self.guilds[guild_id]
+        if user_id in guild.members:
+            self._check_moderatable(guild, user_id)
+            del guild.members[user_id]
+        guild.bans[user_id] = reason
+        if delete_message_seconds:
+            cutoff = self.clock.now() - timedelta(seconds=delete_message_seconds)
+            for channel_id, msgs in self.channels.items():
+                self.channels[channel_id] = [m for m in msgs if not (m.author_id == user_id and m.created_at >= cutoff)]
+        self._after("ban_user")
+
+    async def unban_user(self, guild_id: int, user_id: int, *, reason: str) -> None:
+        self._before("unban_user", guild_id, user_id, reason)
+        guild = self.guilds[guild_id]
+        if user_id not in guild.bans:
+            raise OpNotFound("404 Not Found (error code: 10026): Unknown Ban", code=10026)
+        del guild.bans[user_id]
+        self._after("unban_user")
+
+    async def purge(
+        self, channel_id: int, *, limit: int, author_id: int | None, not_before: datetime, reason: str
+    ) -> PurgeResult:
+        self._before("purge", channel_id, limit, author_id, reason)
+        if channel_id not in self.channels:
+            raise OpNotFound("Unknown Channel", code=10003)
+        scanned = self.channels[channel_id][-limit:]  # the newest ``limit`` messages
+        delete: set[int] = set()
+        old = pinned = 0
+        for msg in scanned:
+            if author_id is not None and msg.author_id != author_id:
+                continue
+            if msg.pinned:
+                pinned += 1
+            elif msg.created_at < ensure_utc(not_before):
+                old += 1
+            else:
+                delete.add(msg.id)
+        self.channels[channel_id] = [m for m in self.channels[channel_id] if m.id not in delete]
+        self._after("purge")
+        return PurgeResult(len(delete), old, pinned)
+
+    async def dm_user(self, user_id: int, *, content: str | None = None, embed: discord.Embed | None = None) -> bool:
+        self._before("dm_user", user_id)
+        if user_id in self.closed_dms:
+            return False
+        self.dms.setdefault(user_id, []).append(
+            {"content": content, "embed": embed.to_dict() if embed is not None else None}
+        )
+        self._after("dm_user")
+        return True
 
 
 def make_config(tmp_path: Path, **overrides: Any) -> Config:
