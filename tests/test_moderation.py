@@ -602,6 +602,7 @@ async def test_warn_dms_and_records(staff: App, fake: FakeDiscord) -> None:
     assert "Cool \\*Server\\*" in dm["content"] and "be nice" in dm["content"]
     entry = fake.messages(MODLOG)[0]
     assert entry.embed["title"] == "Warn · Case #1"
+    assert {f["name"]: f["value"] for f in entry.embed["fields"]}["DM"] == "Delivered"
     assert "Active warnings: **2**" in await mod.warn(staff.services, GUILD, "S", ACTOR, TARGET, "again")
 
 
@@ -614,7 +615,7 @@ async def test_warn_never_fails_on_undeliverable_dm(staff: App, fake: FakeDiscor
     message = await mod.warn(staff.services, GUILD, "S", ACTOR, TARGET, "be nice")
     assert "couldn't DM" in message and "case #1" in message
     fields = {f["name"]: f["value"] for f in fake.messages(MODLOG)[0].embed["fields"]}
-    assert "DM not delivered" in fields["Note"]
+    assert fields["DM"].startswith("Not delivered")
     assert len(await staff.repo.active_warnings(GUILD, TARGET)) == 1
 
 
@@ -810,3 +811,240 @@ async def test_command_callbacks_defer_and_reply_ephemerally(staff: App, fake: F
         assert "isn't a valid user ID" in unban.response.sent[0]
     finally:
         await client.close()
+
+
+# ===================================================== escalation (C)
+
+
+async def test_warn_escalates_at_exact_thresholds(staff: App, fake: FakeDiscord, clock: Any) -> None:
+    s = staff.services
+    await mod.add_warn_threshold(s, GUILD, 2, timedelta(minutes=10))
+    await mod.add_warn_threshold(s, GUILD, 4, timedelta(hours=1))
+    first = await mod.warn(s, GUILD, "S", ACTOR, TARGET, "one")
+    assert "timed out" not in first and fake.guilds[GUILD].members[TARGET].timeout_until is None
+    second = await mod.warn(s, GUILD, "S", ACTOR, TARGET, "two")
+    assert "That's 2 warnings, so they're timed out for 10m" in second and "Case #3." in second
+    assert fake.guilds[GUILD].members[TARGET].timeout_until == clock.now() + timedelta(minutes=10)
+    auto = await staff.repo.get_case(GUILD, 3)
+    assert auto is not None and auto.action == "timeout" and auto.reason == "Auto: 2 warnings"
+    assert auto.extra == {"warn_case": 2} and auto.duration_seconds == 600 and auto.moderator_id == MOD
+    titles = [m.embed["title"] for m in fake.messages(MODLOG)]
+    assert titles == ["Warn · Case #1", "Warn · Case #2", "Timeout · Case #3"]
+    fields = {f["name"]: f["value"] for f in fake.messages(MODLOG)[2].embed["fields"]}
+    assert fields["Triggered by"] == "Warning #2" and fields["Reason"] == "Auto: 2 warnings"
+    third = await mod.warn(s, GUILD, "S", ACTOR, TARGET, "three")  # no rule for 3
+    assert "timed out" not in third
+    # Clearing a warning lowers the count, so the next one reaches 3 again, not 4.
+    await mod.clear_warning(s, GUILD, ACTOR, 1)
+    assert "timed out" not in await mod.warn(s, GUILD, "S", ACTOR, TARGET, "again")
+    assert "timed out for 1h" in await mod.warn(s, GUILD, "S", ACTOR, TARGET, "four")
+
+
+async def test_impossible_auto_timeout_keeps_the_warning_and_says_why(staff: App, fake: FakeDiscord) -> None:
+    await mod.add_warn_threshold(staff.services, GUILD, 1, timedelta(minutes=10))
+    fake.guilds[GUILD].members[TARGET].administrator = True
+    message = await mod.warn(staff.services, GUILD, "S", ACTOR, TARGET, "one")
+    assert "Warned" in message and "Auto-timeout not applied" in message and "Administrator" in message
+    assert await cases(staff) == [(1, "warn", TARGET)]
+    assert len(await staff.repo.active_warnings(GUILD, TARGET)) == 1
+    info = fake.messages(MODLOG)[-1].embed
+    assert info["title"] == "Auto-timeout not applied" and "Administrator" in info["description"]
+    # A Discord failure is reported the same way.
+    fake.guilds[GUILD].members[TARGET].administrator = False
+    await staff.repo.clear_warnings(GUILD, TARGET)
+    fake.fail_next("timeout_member", OpForbidden("Missing Permissions", code=50013))
+    message = await mod.warn(staff.services, GUILD, "S", ACTOR, TARGET, "again")
+    assert "Auto-timeout not applied" in message and "Discord refused" in message
+
+
+async def test_warnconfig(staff: App) -> None:
+    s = staff.services
+    assert "No automatic timeouts" in await mod.list_warn_thresholds(s, GUILD)
+    assert "exactly 3 active warning(s)" in await mod.add_warn_threshold(s, GUILD, 3, timedelta(hours=2))
+    await mod.add_warn_threshold(s, GUILD, 5, timedelta(days=1))
+    text = await mod.list_warn_thresholds(s, GUILD)
+    assert "• 3 warning(s) → timeout 2h" in text and "• 5 warning(s) → timeout 1d" in text
+    with pytest.raises(ModError, match="28 days"):
+        await mod.add_warn_threshold(s, GUILD, 6, timedelta(days=29))
+    with pytest.raises(ModError, match="between 1 and 100"):
+        await mod.add_warn_threshold(s, GUILD, 0, timedelta(hours=1))
+    assert "Removed" in await mod.remove_warn_threshold(s, GUILD, 3)
+    with pytest.raises(ModError, match="no rule"):
+        await mod.remove_warn_threshold(s, GUILD, 3)
+
+
+# =========================================================== cases (E)
+
+
+async def test_case_view(staff: App, fake: FakeDiscord) -> None:
+    await mod.warn(staff.services, GUILD, "S", ACTOR, TARGET, "be nice")
+    embed = await mod.view_case(staff.services, GUILD, 1)
+    fields = {f.name: f.value for f in embed.fields}
+    assert embed.title == "Warn · Case #1" and fields["Status"] == "Active" and fields["Reason"] == "be nice"
+    entry = fake.messages(MODLOG)[0]
+    assert fields["Mod log"] == f"[Jump to entry](https://discord.com/channels/{GUILD}/{MODLOG}/{entry.id})"
+    await mod.clear_warning(staff.services, GUILD, ACTOR, 1)
+    assert {f.name: f.value for f in (await mod.view_case(staff.services, GUILD, 1)).fields}["Status"] == "Cleared"
+    with pytest.raises(ModError, match="no case #9"):
+        await mod.view_case(staff.services, GUILD, 9)
+    with pytest.raises(ModError, match="no case #1"):
+        await mod.view_case(staff.services, OTHER_GUILD, 1)  # cases are per server
+
+
+async def test_case_reason_edits_the_mod_log_entry(staff: App, fake: FakeDiscord) -> None:
+    fake.closed_dms.add(TARGET)
+    await mod.warn(staff.services, GUILD, "S", ACTOR, TARGET, "typo")
+    message = await mod.edit_case_reason(staff.services, GUILD, 1, "the real reason")
+    assert "and its mod-log entry" in message
+    [entry] = fake.messages(MODLOG)
+    fields = {f["name"]: f["value"] for f in entry.embed["fields"]}
+    assert fields["Reason"] == "the real reason" and fields["DM"].startswith("Not delivered")  # re-rendered in full
+    assert entry.embed["title"] == "Warn · Case #1"
+    fake.channels[MODLOG].clear()  # someone deleted the log entry
+    assert "couldn't be edited" in await mod.edit_case_reason(staff.services, GUILD, 1, "x")
+    assert (await staff.repo.get_case(GUILD, 1)).reason == "x"  # type: ignore[union-attr]
+    await staff.repo.set_modlog_channel(GUILD, None, staff.services.clock.now())
+    await mod.kick(staff.services, GUILD, ACTOR, 12, None)
+    assert "no mod-log entry" in await mod.edit_case_reason(staff.services, GUILD, 2, "y")
+    with pytest.raises(ModError):
+        await mod.edit_case_reason(staff.services, GUILD, 99, "z")
+
+
+# ===================================================== context menus (D)
+
+
+async def test_delete_and_warn(staff: App, fake: FakeDiscord) -> None:
+    msg = fake.add_user_message(CHANNEL, TARGET, content="buy cheap **coins**")
+    message = await mod.delete_and_warn(
+        staff.services, GUILD, "S", ACTOR, channel_id=CHANNEL, message_id=msg, author_id=TARGET,
+        content="buy cheap **coins**", reason="spam",
+    )
+    assert message.startswith("Deleted the message. Warned <@11>")
+    assert msg not in {m.id for m in fake.messages(CHANNEL)}
+    case = await staff.repo.get_case(GUILD, 1)
+    assert case is not None and case.extra["deleted_message"] == {
+        "channel_id": CHANNEL, "message_id": msg, "excerpt": "buy cheap \\*\\*coins\\*\\*",
+    }
+    fields = {f["name"]: f["value"] for f in fake.messages(MODLOG)[0].embed["fields"]}
+    assert fields["Deleted message"] == f"In <#{CHANNEL}>: buy cheap \\*\\*coins\\*\\*"
+    # Already deleted by someone else: the warning still applies.
+    assert "Warned" in await mod.delete_and_warn(
+        staff.services, GUILD, "S", ACTOR, channel_id=CHANNEL, message_id=msg, author_id=TARGET,
+        content=None, reason="spam",
+    )
+
+
+async def test_delete_and_warn_respects_the_hierarchy_before_deleting(staff: App, fake: FakeDiscord) -> None:
+    msg = fake.add_user_message(CHANNEL, OWNER)
+    with pytest.raises(ModError, match="server owner"):
+        await mod.delete_and_warn(
+            staff.services, GUILD, "S", ACTOR, channel_id=CHANNEL, message_id=msg, author_id=OWNER,
+            content="hi", reason="x",
+        )
+    assert msg in {m.id for m in fake.messages(CHANNEL)} and await cases(staff) == []
+    other = fake.add_user_message(CHANNEL, TARGET)
+    fake.fail_next("delete_message", OpForbidden("Missing Permissions", code=50013))
+    with pytest.raises(ModError, match="refused"):
+        await mod.delete_and_warn(
+            staff.services, GUILD, "S", ACTOR, channel_id=CHANNEL, message_id=other, author_id=TARGET,
+            content="hi", reason="x",
+        )
+    assert await cases(staff) == []  # no warning when the deletion failed
+
+
+async def test_context_menus_are_gated_and_open_forms(staff: App, fake: FakeDiscord) -> None:
+    from discord import AppCommandType, app_commands
+
+    from bot.commands.moderation import DeleteWarnModal, TimeoutModal, WarnModal
+
+    client, tree = await _mod_tree(staff.services)
+    try:
+        menus = {
+            (c.name, c.type): c for c in tree.get_commands(type=AppCommandType.user) + tree.get_commands(
+                type=AppCommandType.message)
+        }
+        expected = {
+            ("Warn", AppCommandType.user): discord.Permissions(moderate_members=True),
+            ("Timeout", AppCommandType.user): discord.Permissions(moderate_members=True),
+            ("Delete + warn", AppCommandType.message): discord.Permissions(moderate_members=True, manage_messages=True),
+        }
+        assert set(menus) == set(expected)
+        for key, perms in expected.items():
+            menu = menus[key]
+            assert isinstance(menu, app_commands.ContextMenu)
+            assert menu.default_permissions == perms and menu.guild_only and menu.checks, key
+            assert menu.to_dict(tree)["default_member_permissions"] == perms.value
+
+        sent: list[Any] = []
+
+        async def send_modal(modal: Any) -> None:
+            sent.append(modal)
+
+        interaction = _interaction()
+        interaction.response.send_modal = send_modal
+        await menus[("Warn", AppCommandType.user)].callback(interaction, SimpleNamespace(id=TARGET))
+        await menus[("Timeout", AppCommandType.user)].callback(interaction, SimpleNamespace(id=TARGET))
+        msg = SimpleNamespace(id=5, guild=SimpleNamespace(id=GUILD), channel=SimpleNamespace(id=CHANNEL),
+                              author=SimpleNamespace(id=TARGET), content="spam")
+        await menus[("Delete + warn", AppCommandType.message)].callback(interaction, msg)
+        assert [type(m) for m in sent] == [WarnModal, TimeoutModal, DeleteWarnModal]
+        for modal in sent:  # the payload Discord receives: titles and labels within its 45-character limits
+            payload = modal.to_dict()
+            assert 0 < len(payload["title"]) <= 45
+            labels = [c for c in payload["components"] if c["type"] == discord.ComponentType.label.value]
+            assert labels and all(len(c["label"]) <= 45 and len(c.get("description", "")) <= 100 for c in labels)
+        foreign = SimpleNamespace(id=6, guild=SimpleNamespace(id=OTHER_GUILD), channel=SimpleNamespace(id=1),
+                                  author=SimpleNamespace(id=TARGET), content="")
+        await menus[("Delete + warn", AppCommandType.message)].callback(interaction, foreign)
+        assert len(sent) == 3 and "isn't from this server" in interaction.response.sent[0]
+    finally:
+        await client.close()
+
+
+async def test_forms_run_the_same_actions(staff: App, fake: FakeDiscord, clock: Any) -> None:
+    from bot.commands.moderation import DeleteWarnModal, TimeoutModal, WarnModal
+
+    warn_form = WarnModal(staff.services, TARGET)
+    warn_form.reason.component._value = "via menu"
+    interaction = _interaction()
+    await warn_form.on_submit(interaction)
+    assert "Warned <@11>" in interaction.followups[0]
+
+    timeout_form = TimeoutModal(staff.services, TARGET)
+    timeout_form.duration.component._value = "nope"
+    interaction = _interaction()
+    await timeout_form.on_submit(interaction)
+    assert "Use a duration like" in interaction.response.sent[0]
+    timeout_form.duration.component._value = "5m"
+    timeout_form.reason.component._value = ""
+    interaction = _interaction()
+    await timeout_form.on_submit(interaction)
+    assert "timed out until" in interaction.followups[0]
+    assert (await staff.repo.get_case(GUILD, 2)).reason is None  # type: ignore[union-attr]
+
+    msg_id = fake.add_user_message(CHANNEL, TARGET, content="bad")
+    message = SimpleNamespace(id=msg_id, channel=SimpleNamespace(id=CHANNEL), author=SimpleNamespace(id=TARGET),
+                              content="bad")
+    form = DeleteWarnModal(staff.services, message)  # type: ignore[arg-type]
+    form.reason.component._value = "rule 3"
+    interaction = _interaction()
+    await form.on_submit(interaction)
+    assert interaction.followups[0].startswith("Deleted the message.")
+    assert msg_id not in {m.id for m in fake.messages(CHANNEL)}
+
+    # Owner protection applies through the forms too.
+    owner_form = WarnModal(staff.services, OWNER)
+    owner_form.reason.component._value = "x"
+    interaction = _interaction()
+    await owner_form.on_submit(interaction)
+    assert "server owner" in interaction.followups[0]
+
+
+async def test_form_errors_are_reported_not_swallowed(staff: App, caplog: pytest.LogCaptureFixture) -> None:
+    from bot.commands.moderation import WarnModal
+
+    form = WarnModal(staff.services, TARGET)
+    interaction = _interaction()
+    await form.on_error(interaction, RuntimeError("boom"))
+    assert "Something went wrong" in interaction.response.sent[0]
+    assert any("Moderation form WarnModal failed" in r.getMessage() for r in caplog.records)
