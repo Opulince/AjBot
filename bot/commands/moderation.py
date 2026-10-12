@@ -40,6 +40,105 @@ async def run_action(interaction: discord.Interaction, action: Callable[[], Awai
     await _reply(interaction, message)
 
 
+# ------------------------------------------------------------------ modals
+
+
+def _value(field: discord.ui.Label) -> str:
+    component = field.component
+    assert isinstance(component, discord.ui.TextInput)
+    return component.value
+
+
+class _ModModal(discord.ui.Modal):
+    """Base for the context-menu forms: errors are reported to the moderator, not swallowed."""
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:  # type: ignore[override]
+        log.error("Moderation form %s failed in guild %s", type(self).__name__, interaction.guild_id, exc_info=error)
+        try:
+            await _reply(interaction, "Something went wrong while running that action. The error has been logged.")
+        except discord.HTTPException:
+            log.warning("Could not deliver the error message for a moderation form")
+
+
+def _reason_input(*, required: bool = True) -> discord.ui.TextInput:
+    return discord.ui.TextInput(style=discord.TextStyle.paragraph, required=required, max_length=mod.REASON_MAX)
+
+
+class WarnModal(_ModModal, title="Warn member"):
+    reason: discord.ui.Label = discord.ui.Label(
+        text="Reason", description="Shown to them (by DM) and in the mod log.", component=_reason_input()
+    )
+
+    def __init__(self, services: "Services", target_id: int) -> None:
+        super().__init__()
+        self.services = services
+        self.target_id = target_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        guild = interaction.guild
+        assert guild is not None
+        reason = _value(self.reason)
+        await run_action(
+            interaction, lambda: mod.warn(self.services, guild.id, guild.name, actor_of(interaction), self.target_id, reason)
+        )
+
+
+class TimeoutModal(_ModModal, title="Time out member"):
+    duration: discord.ui.Label = discord.ui.Label(
+        text="Duration", description="30s, 10m, 2h, 7d or 1h30m (at most 28d).",
+        component=discord.ui.TextInput(placeholder="10m", max_length=32),
+    )
+    reason: discord.ui.Label = discord.ui.Label(
+        text="Reason", description="Optional. Shown in the mod log and the Audit Log.",
+        component=_reason_input(required=False),
+    )
+
+    def __init__(self, services: "Services", target_id: int) -> None:
+        super().__init__()
+        self.services = services
+        self.target_id = target_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        assert interaction.guild_id is not None
+        guild_id = interaction.guild_id
+        try:
+            length = mod.parse_duration(_value(self.duration))
+        except mod.ModError as exc:
+            await _reply(interaction, str(exc))
+            return
+        reason = _value(self.reason) or None
+        await run_action(
+            interaction,
+            lambda: mod.timeout(self.services, guild_id, actor_of(interaction), self.target_id, length, reason),
+        )
+
+
+class DeleteWarnModal(_ModModal, title="Delete message and warn"):
+    reason: discord.ui.Label = discord.ui.Label(
+        text="Reason", description="Shown to them (by DM) and in the mod log.", component=_reason_input()
+    )
+
+    def __init__(self, services: "Services", message: discord.Message) -> None:
+        super().__init__()
+        self.services = services
+        self.channel_id = message.channel.id
+        self.message_id = message.id
+        self.author_id = message.author.id
+        self.content = message.content
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        guild = interaction.guild
+        assert guild is not None
+        reason = _value(self.reason)
+        await run_action(
+            interaction,
+            lambda: mod.delete_and_warn(
+                self.services, guild.id, guild.name, actor_of(interaction), channel_id=self.channel_id,
+                message_id=self.message_id, author_id=self.author_id, content=self.content, reason=reason,
+            ),
+        )
+
+
 def register_moderation_commands(tree: app_commands.CommandTree, services: "Services") -> None:
     # ------------------------------------------------------------ timeouts
 
@@ -249,3 +348,107 @@ def register_moderation_commands(tree: app_commands.CommandTree, services: "Serv
         await _reply(interaction, await mod.set_modlog(services, interaction.guild_id, None))
 
     tree.add_command(modlog)
+
+    # ----------------------------------------------------- warn escalation
+
+    warnconfig = app_commands.Group(
+        name="warnconfig",
+        description="Automatic timeouts when a member reaches a number of active warnings",
+        guild_only=True,
+        default_permissions=discord.Permissions(manage_guild=True),
+    )
+
+    @warnconfig.command(name="add", description="Time members out automatically at a warning count")
+    @app_commands.describe(count="Active warnings that trigger it", duration="Timeout length: 10m, 2h, 1d … (max 28d)")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def warnconfig_add_cmd(
+        interaction: discord.Interaction, count: app_commands.Range[int, 1, 100], duration: str
+    ) -> None:
+        assert interaction.guild_id is not None
+        try:
+            message = await mod.add_warn_threshold(services, interaction.guild_id, count, mod.parse_duration(duration))
+        except mod.ModError as exc:
+            message = str(exc)
+        await _reply(interaction, message)
+
+    @warnconfig.command(name="remove", description="Remove the automatic timeout for a warning count")
+    @app_commands.describe(count="The warning count of the rule to remove")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def warnconfig_remove_cmd(interaction: discord.Interaction, count: app_commands.Range[int, 1, 100]) -> None:
+        assert interaction.guild_id is not None
+        try:
+            message = await mod.remove_warn_threshold(services, interaction.guild_id, count)
+        except mod.ModError as exc:
+            message = str(exc)
+        await _reply(interaction, message)
+
+    @warnconfig.command(name="list", description="List the automatic timeouts")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def warnconfig_list_cmd(interaction: discord.Interaction) -> None:
+        assert interaction.guild_id is not None
+        await _reply(interaction, await mod.list_warn_thresholds(services, interaction.guild_id))
+
+    tree.add_command(warnconfig)
+
+    # --------------------------------------------------------------- cases
+
+    case = app_commands.Group(
+        name="case",
+        description="Look up or correct moderation cases",
+        guild_only=True,
+        default_permissions=discord.Permissions(moderate_members=True),
+    )
+
+    @case.command(name="view", description="Show a moderation case")
+    @app_commands.describe(case_id="Case number")
+    @app_commands.checks.has_permissions(moderate_members=True)
+    async def case_view_cmd(interaction: discord.Interaction, case_id: app_commands.Range[int, 1]) -> None:
+        assert interaction.guild_id is not None
+        try:
+            embed = await mod.view_case(services, interaction.guild_id, case_id)
+        except mod.ModError as exc:
+            await _reply(interaction, str(exc))
+            return
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @case.command(name="reason", description="Change a case's reason (also edits its mod-log entry)")
+    @app_commands.describe(case_id="Case number", reason="The new reason")
+    @app_commands.checks.has_permissions(moderate_members=True)
+    async def case_reason_cmd(
+        interaction: discord.Interaction, case_id: app_commands.Range[int, 1], reason: Reason
+    ) -> None:
+        assert interaction.guild_id is not None
+        await run_action(interaction, lambda: mod.edit_case_reason(services, interaction.guild_id, case_id, reason))
+
+    tree.add_command(case)
+
+    # ------------------------------------------------------- context menus
+    # Discord allows 5 user and 5 message context menus per app; this adds 2 + 1.
+    # The decorators below the context_menu one are read when the menu is created:
+    # default_permissions hides it, the checks re-verify at runtime.
+
+    @tree.context_menu(name="Warn")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(moderate_members=True)
+    @app_commands.checks.has_permissions(moderate_members=True)
+    async def warn_menu(interaction: discord.Interaction, member: discord.Member) -> None:
+        await interaction.response.send_modal(WarnModal(services, member.id))
+
+    @tree.context_menu(name="Timeout")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(moderate_members=True)
+    @app_commands.checks.has_permissions(moderate_members=True)
+    @app_commands.checks.bot_has_permissions(moderate_members=True)
+    async def timeout_menu(interaction: discord.Interaction, member: discord.Member) -> None:
+        await interaction.response.send_modal(TimeoutModal(services, member.id))
+
+    @tree.context_menu(name="Delete + warn")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(moderate_members=True, manage_messages=True)
+    @app_commands.checks.has_permissions(moderate_members=True, manage_messages=True)
+    @app_commands.checks.bot_has_permissions(manage_messages=True)
+    async def delete_warn_menu(interaction: discord.Interaction, message: discord.Message) -> None:
+        if message.guild is None or message.guild.id != interaction.guild_id:
+            await _reply(interaction, "That message isn't from this server.")
+            return
+        await interaction.response.send_modal(DeleteWarnModal(services, message))

@@ -64,9 +64,12 @@ def build_case_embed(
     duration_seconds: int | None,
     created_at: datetime,
     extra: Mapping[str, Any] | None = None,
-    note: str | None = None,
 ) -> discord.Embed:
-    """The mod-log entry for a case. ``case_id`` is ``None`` if the case record could not be saved."""
+    """The mod-log entry for a case. ``case_id`` is ``None`` if the case record could not be saved.
+
+    Everything shown comes from the stored case, so re-rendering it later (``/case reason``)
+    reproduces the same entry.
+    """
     extra = extra or {}
     label = ACTION_LABELS.get(action, action)
     title = f"{label} · Case #{case_id}" if case_id is not None else f"{label} · case not saved"
@@ -94,9 +97,18 @@ def build_case_embed(
         embed.add_field(name="Period", value=str(extra["period"]), inline=True)
     if extra.get("ban_case"):
         embed.add_field(name="Ban case", value=f"#{extra['ban_case']}", inline=True)
+    if extra.get("warn_case"):
+        embed.add_field(name="Triggered by", value=f"Warning #{extra['warn_case']}", inline=True)
+    deleted = extra.get("deleted_message")
+    if isinstance(deleted, Mapping):
+        excerpt = deleted.get("excerpt")
+        text = f"In <#{deleted.get('channel_id')}>" + (f": {excerpt}" if excerpt else " (no text)")
+        embed.add_field(name="Deleted message", value=clip(text), inline=False)
     embed.add_field(name="Reason", value=clip(reason) if reason else "*No reason given*", inline=False)
-    if note:
-        embed.add_field(name="Note", value=clip(note), inline=False)
+    if action == "warn" and "dm" in extra:
+        embed.add_field(
+            name="DM", value="Delivered" if extra["dm"] else "Not delivered (closed DMs or an error)", inline=True
+        )
     return embed
 
 
