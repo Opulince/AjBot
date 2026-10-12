@@ -28,6 +28,7 @@ from dotenv import find_dotenv, load_dotenv
 from bot.boards import BoardService
 from bot.clock import Clock, SystemClock
 from bot.commands.admin import register_admin_commands
+from bot.commands.moderation import register_moderation_commands
 from bot.commands.stats import register_stats_command
 from bot.config import Config, ConfigError, load_config, prepare_storage
 from bot.counting.buffer import CountBuffer
@@ -192,6 +193,7 @@ class LeaderboardBot(discord.Client):
         register_persistent_items(self)
         register_admin_commands(self.tree, services)
         register_stats_command(self.tree, services)
+        register_moderation_commands(self.tree, services)
         try:
             synced = await self.tree.sync()
             log.info("Synced %d application commands", len(synced))

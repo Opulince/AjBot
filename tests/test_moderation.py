@@ -11,8 +11,11 @@ from typing import Any
 import discord
 import pytest
 
+from bot import moderation as mod
 from bot.clock import UTC
-from bot.discord_ops import DiscordPyOps, MemberRank, OpForbidden, PurgeResult, rank_of, role_rank
+from bot.commands.admin import describe_command_error
+from bot.discord_ops import DiscordPyOps, MemberRank, OpForbidden, OpNetwork, PurgeResult, rank_of, role_rank
+from bot.moderation import Actor, ModError
 from tests.conftest import CHANNEL, GUILD, T0
 from tests.fakes import App, FakeDiscord, snowflake_at
 
@@ -358,3 +361,452 @@ async def test_production_dm_returns_false_for_closed_dms() -> None:
 def test_member_rank_is_frozen_and_comparable() -> None:
     a = MemberRank(1, (5, -70), owner=False, administrator=False)
     assert a.top_role > (5, -71) and not (a.top_role > (5, -70))
+
+
+# ================================================================ actions
+#
+# Hierarchy used below (the bot's top role is at position 100):
+#   OWNER (no roles) · MOD (role at 50) · TARGET=11 (role at 20) · 12-15 (no roles)
+
+OWNER = 30
+MODLOG = 300
+ROLE_MOD = 600
+ROLE_MEMBER = 601
+ROLE_HIGH = 602
+
+
+@pytest.fixture
+async def staff(app: App, fake: FakeDiscord, clock: Any) -> App:
+    fake.create_role(GUILD, ROLE_MOD, position=50)
+    fake.create_role(GUILD, ROLE_MEMBER, position=20)
+    fake.add_member(GUILD, MOD, "Mod", roles=(ROLE_MOD,))
+    fake.guilds[GUILD].members[TARGET].roles.add(ROLE_MEMBER)
+    fake.guilds[GUILD].owner_id = OWNER
+    fake.add_member(GUILD, OWNER, "Owner")
+    fake.add_channel(MODLOG)
+    await app.repo.set_modlog_channel(GUILD, MODLOG, clock.now())
+    return app
+
+
+ACTOR = Actor(MOD, "Mod")
+MOD_ACTIONS = ("timeout", "untimeout", "warn", "kick", "ban")
+DISCORD_OPS = ("timeout_member", "kick_member", "ban_user", "unban_user", "purge")
+
+
+async def act(app: App, action: str, target: int, actor: Actor = ACTOR, reason: str | None = "spam") -> str:
+    s = app.services
+    if action == "timeout":
+        return await mod.timeout(s, GUILD, actor, target, timedelta(minutes=10), reason)
+    if action == "untimeout":
+        return await mod.untimeout(s, GUILD, actor, target, reason)
+    if action == "warn":
+        return await mod.warn(s, GUILD, "Test Server", actor, target, reason or "r")
+    if action == "kick":
+        return await mod.kick(s, GUILD, actor, target, reason)
+    if action == "ban":
+        return await mod.ban(s, GUILD, actor, target, reason)
+    raise AssertionError(action)
+
+
+def mutations(fake: FakeDiscord) -> int:
+    return sum(fake.count(op) for op in DISCORD_OPS)
+
+
+async def cases(app: App) -> list[Any]:
+    async with app.services.db.read() as conn:
+        async with conn.execute("SELECT case_id, action, target_id FROM mod_cases ORDER BY case_id") as cur:
+            return [tuple(r) for r in await cur.fetchall()]
+
+
+def test_parse_duration() -> None:
+    assert mod.parse_duration("30s") == timedelta(seconds=30)
+    assert mod.parse_duration("10m") == timedelta(minutes=10)
+    assert mod.parse_duration("2h") == timedelta(hours=2)
+    assert mod.parse_duration("7D") == timedelta(days=7)
+    assert mod.parse_duration("1h 30m") == timedelta(minutes=90)
+    assert mod.parse_duration("1w") == timedelta(days=7)
+    for bad in ("", "10", "m", "10x", "-5m", "0s", "1.5h", "ten minutes", "5m; drop"):
+        with pytest.raises(ModError):
+            mod.parse_duration(bad)
+
+
+def test_parse_user_id() -> None:
+    assert mod.parse_user_id(" 123456789012345678 ") == 123456789012345678
+    assert mod.parse_user_id("<@123456789012345678>") == 123456789012345678
+    assert mod.parse_user_id("<@!123456789012345678>") == 123456789012345678
+    for bad in ("", "abc", "12", "123456789012345678x"):
+        with pytest.raises(ModError):
+            mod.parse_user_id(bad)
+
+
+# -------------------------------------------------------------- safety
+
+
+@pytest.mark.parametrize("action", MOD_ACTIONS)
+async def test_cannot_target_self_bot_or_owner(staff: App, fake: FakeDiscord, action: str) -> None:
+    for target, expected in ((MOD, "yourself"), (fake.bot_user_id, "myself"), (OWNER, "server owner")):
+        with pytest.raises(ModError, match=expected):
+            await act(staff, action, target)
+    assert mutations(fake) == 0 and await cases(staff) == [] and fake.dms == {}
+
+
+@pytest.mark.parametrize("action", MOD_ACTIONS)
+async def test_moderator_must_strictly_outrank_target(staff: App, fake: FakeDiscord, action: str) -> None:
+    fake.guilds[GUILD].members[TARGET].roles.add(ROLE_MOD)  # same top role as the moderator
+    with pytest.raises(ModError, match="below yours"):
+        await act(staff, action, TARGET)
+    fake.create_role(GUILD, 603, position=60)  # now above the moderator
+    fake.guilds[GUILD].members[TARGET].roles.add(603)
+    with pytest.raises(ModError, match="below yours"):
+        await act(staff, action, TARGET)
+    assert mutations(fake) == 0 and await cases(staff) == []
+
+
+async def test_owner_bypasses_the_moderator_hierarchy(staff: App, fake: FakeDiscord) -> None:
+    # The owner has no roles at all, but may still kick someone with a role.
+    message = await mod.kick(staff.services, GUILD, Actor(OWNER, "Owner"), TARGET, "bye")
+    assert "Kicked" in message and TARGET not in fake.guilds[GUILD].members
+
+
+@pytest.mark.parametrize("action", ["timeout", "untimeout", "kick", "ban"])
+async def test_bot_must_outrank_target_with_a_clear_message(staff: App, fake: FakeDiscord, action: str) -> None:
+    fake.guilds[GUILD].roles[ROLE_MOD].position = 160  # moderator above the bot
+    fake.create_role(GUILD, ROLE_HIGH, position=120)  # target between the bot (100) and the moderator
+    fake.guilds[GUILD].members[TARGET].roles.add(ROLE_HIGH)
+    fake.guilds[GUILD].members[TARGET].timeout_until = staff.services.clock.now() + timedelta(hours=1)
+    with pytest.raises(ModError, match="My highest role isn't above .* Move my role higher"):
+        await act(staff, action, TARGET)
+    assert mutations(fake) == 0 and await cases(staff) == []
+
+
+async def test_warn_needs_no_bot_hierarchy(staff: App, fake: FakeDiscord) -> None:
+    """A warning is only a record and a DM, so the bot's role position doesn't matter."""
+    fake.guilds[GUILD].roles[ROLE_MOD].position = 160
+    fake.create_role(GUILD, ROLE_HIGH, position=120)
+    fake.guilds[GUILD].members[TARGET].roles.add(ROLE_HIGH)
+    assert "Warned" in await act(staff, "warn", TARGET)
+
+
+async def test_timing_out_an_administrator_is_refused_cleanly(staff: App, fake: FakeDiscord) -> None:
+    fake.guilds[GUILD].members[TARGET].administrator = True
+    with pytest.raises(ModError, match="Administrator"):
+        await act(staff, "timeout", TARGET)
+    assert fake.count("timeout_member") == 0 and await cases(staff) == []
+
+
+async def test_non_members_cannot_be_kicked_but_can_be_banned(staff: App, fake: FakeDiscord) -> None:
+    for action in ("timeout", "untimeout", "warn", "kick"):
+        with pytest.raises(ModError, match="isn't a member"):
+            await act(staff, action, 4242)
+    message = await act(staff, "ban", 4242)
+    assert "Banned" in message and 4242 in fake.guilds[GUILD].bans
+    assert await cases(staff) == [(1, "ban", 4242)]
+
+
+async def test_unknown_roles_fail_closed(staff: App, fake: FakeDiscord) -> None:
+    fake.fail_next("member_rank", OpNetwork("timeout"), OpNetwork("timeout"), OpNetwork("timeout"))
+    with pytest.raises(ModError, match="couldn't check"):
+        await act(staff, "kick", TARGET)
+    assert mutations(fake) == 0 and TARGET in fake.guilds[GUILD].members
+
+
+async def test_raw_forbidden_from_discord_becomes_a_clear_message_and_no_case(staff: App, fake: FakeDiscord) -> None:
+    fake.fail_next("kick_member", OpForbidden("403 Forbidden (error code: 50013): Missing Permissions", code=50013))
+    with pytest.raises(ModError, match="Discord refused to kick"):
+        await act(staff, "kick", TARGET)
+    assert await cases(staff) == [] and fake.messages(MODLOG) == []
+
+
+async def test_case_write_failure_after_success_still_reports_success(
+    staff: App, fake: FakeDiscord, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def broken(*_a: Any, **_k: Any) -> Any:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(staff.repo, "create_case", broken)
+    message = await act(staff, "kick", TARGET)
+    assert "Kicked" in message and "couldn't be saved" in message
+    assert TARGET not in fake.guilds[GUILD].members  # the kick happened
+    assert any("could not be saved" in r.getMessage() and r.levelname == "ERROR" for r in caplog.records)
+    [entry] = fake.messages(MODLOG)
+    assert entry.embed["title"] == "Kick · case not saved"
+
+
+# ------------------------------------------------- mod log and audit log
+
+
+async def test_mod_log_entry_and_audit_reason(staff: App, fake: FakeDiscord, clock: Any) -> None:
+    message = await act(staff, "timeout", TARGET, reason="spam in #general")
+    assert "Case #1" in message
+    [entry] = fake.messages(MODLOG)
+    assert entry.mentions == ()  # pings nobody
+    embed = entry.embed
+    assert embed["title"] == "Timeout · Case #1"
+    fields = {f["name"]: f["value"] for f in embed["fields"]}
+    assert fields["User"] == f"<@{TARGET}> (`{TARGET}`)" and fields["Moderator"] == f"<@{MOD}>"
+    assert fields["Reason"] == "spam in #general"
+    end = int((clock.now() + timedelta(minutes=10)).timestamp())
+    assert fields["Duration"].startswith("10m") and f"<t:{end}:R>" in fields["Duration"]
+    case = await staff.repo.get_case(GUILD, 1)
+    assert case is not None and (case.modlog_channel_id, case.modlog_message_id) == (MODLOG, entry.id)
+    call = next(c for c in fake.calls if c[0] == "timeout_member")
+    assert call[4] == f"Mod ({MOD}): spam in #general"  # the Audit Log names the moderator
+
+
+async def test_failed_mod_log_post_never_fails_the_action(staff: App, fake: FakeDiscord) -> None:
+    fake.fail_next("send_message", OpForbidden("Missing Access", code=50001))
+    assert "Kicked" in await act(staff, "kick", TARGET)
+    case = await staff.repo.get_case(GUILD, 1)
+    assert case is not None and case.modlog_message_id is None
+    await staff.repo.set_modlog_channel(GUILD, 999, staff.services.clock.now())  # channel deleted
+    assert "Banned" in await act(staff, "ban", 12)
+    assert [c[1] for c in await cases(staff)] == ["kick", "ban"]
+
+
+async def test_no_mod_log_configured(staff: App, fake: FakeDiscord) -> None:
+    assert "Mod log turned off" in await mod.set_modlog(staff.services, GUILD, None)
+    assert "Kicked" in await act(staff, "kick", TARGET)
+    assert fake.messages(MODLOG) == [] and len(await cases(staff)) == 1
+    assert "<#300>" in await mod.set_modlog(staff.services, GUILD, MODLOG)
+
+
+# ------------------------------------------------------------ timeouts
+
+
+async def test_timeout_and_untimeout(staff: App, fake: FakeDiscord, clock: Any) -> None:
+    with pytest.raises(ModError, match="isn't timed out"):
+        await act(staff, "untimeout", TARGET)
+    with pytest.raises(ModError, match="28 days"):
+        await mod.timeout(staff.services, GUILD, ACTOR, TARGET, timedelta(days=29), None)
+    message = await mod.timeout(staff.services, GUILD, ACTOR, TARGET, timedelta(days=28), None)
+    assert "timed out until" in message
+    assert fake.guilds[GUILD].members[TARGET].timeout_until == clock.now() + timedelta(days=28)
+    assert "Removed the timeout" in await act(staff, "untimeout", TARGET)
+    assert fake.guilds[GUILD].members[TARGET].timeout_until is None
+    assert [c[1] for c in await cases(staff)] == ["timeout", "untimeout"]
+    case = await staff.repo.get_case(GUILD, 1)
+    assert case is not None and case.duration_seconds == 28 * 86400
+    # An expired timeout counts as "not timed out".
+    fake.guilds[GUILD].members[TARGET].timeout_until = clock.now() - timedelta(seconds=1)
+    with pytest.raises(ModError, match="isn't timed out"):
+        await act(staff, "untimeout", TARGET)
+
+
+# ------------------------------------------------------------ warnings
+
+
+async def test_warn_dms_and_records(staff: App, fake: FakeDiscord) -> None:
+    message = await mod.warn(staff.services, GUILD, "Cool *Server*", ACTOR, TARGET, "be nice")
+    assert "case #1" in message and "Active warnings: **1**" in message and "notified by DM" in message
+    [dm] = fake.dms[TARGET]
+    assert "Cool \\*Server\\*" in dm["content"] and "be nice" in dm["content"]
+    entry = fake.messages(MODLOG)[0]
+    assert entry.embed["title"] == "Warn · Case #1"
+    assert "Active warnings: **2**" in await mod.warn(staff.services, GUILD, "S", ACTOR, TARGET, "again")
+
+
+@pytest.mark.parametrize("failure", ["closed", "error"])
+async def test_warn_never_fails_on_undeliverable_dm(staff: App, fake: FakeDiscord, failure: str) -> None:
+    if failure == "closed":
+        fake.closed_dms.add(TARGET)
+    else:
+        fake.fail_next("dm_user", OpNetwork("reset"))
+    message = await mod.warn(staff.services, GUILD, "S", ACTOR, TARGET, "be nice")
+    assert "couldn't DM" in message and "case #1" in message
+    fields = {f["name"]: f["value"] for f in fake.messages(MODLOG)[0].embed["fields"]}
+    assert "DM not delivered" in fields["Note"]
+    assert len(await staff.repo.active_warnings(GUILD, TARGET)) == 1
+
+
+async def test_warnings_list_and_clearing(staff: App, fake: FakeDiscord) -> None:
+    assert "no active warnings" in await mod.list_warnings(staff.services, GUILD, TARGET)
+    for i in range(3):
+        await mod.warn(staff.services, GUILD, "S", ACTOR, TARGET, f"reason {i} with **bold**")
+    text = await mod.list_warnings(staff.services, GUILD, TARGET)
+    assert "(3)" in text and "**#1**" in text and "**#3**" in text and "\\*\\*bold\\*\\*" in text
+    assert "Cleared warning #2" in await mod.clear_warning(staff.services, GUILD, ACTOR, 2)
+    with pytest.raises(ModError, match="isn't an active warning"):
+        await mod.clear_warning(staff.services, GUILD, ACTOR, 2)
+    assert "#2" not in await mod.list_warnings(staff.services, GUILD, TARGET)
+    assert "Cleared 2 warning(s)" in await mod.clear_warnings(staff.services, GUILD, ACTOR, TARGET)
+    with pytest.raises(ModError, match="no active warnings"):
+        await mod.clear_warnings(staff.services, GUILD, ACTOR, TARGET)
+    titles = [m.embed["title"] for m in fake.messages(MODLOG)]
+    assert titles[-2:] == ["Warning cleared", "Warnings cleared"]
+
+
+async def test_long_warning_lists_stay_under_discords_limit(staff: App) -> None:
+    for i in range(60):
+        await staff.repo.create_warning(GUILD, TARGET, moderator_id=MOD, reason="x" * 300, now=T0)
+    text = await mod.list_warnings(staff.services, GUILD, TARGET)
+    assert len(text) < 2000 and "more not shown" in text
+    assert all(len(line) < 400 for line in text.splitlines())
+
+
+# ---------------------------------------------------- kick, ban, unban
+
+
+async def test_ban_with_message_deletion_and_unban(staff: App, fake: FakeDiscord, clock: Any) -> None:
+    fake.add_user_message(CHANNEL, TARGET)
+    message = await mod.ban(staff.services, GUILD, ACTOR, TARGET, "raid", delete_message_days=1)
+    assert "Banned" in message and TARGET in fake.guilds[GUILD].bans
+    assert not [m for m in fake.messages(CHANNEL) if m.author_id == TARGET]
+    case = await staff.repo.get_case(GUILD, 1)
+    assert case is not None and case.extra == {"delete_message_days": 1}
+    fields = {f["name"]: f["value"] for f in fake.messages(MODLOG)[0].embed["fields"]}
+    assert fields["Duration"] == "Permanent" and fields["Deleted messages"] == "Last 1 day(s)"
+    with pytest.raises(ModError, match="0 to 7"):
+        await mod.ban(staff.services, GUILD, ACTOR, 12, None, delete_message_days=8)
+    assert "Unbanned" in await mod.unban(staff.services, GUILD, ACTOR, TARGET, "appeal")
+    assert TARGET not in fake.guilds[GUILD].bans
+    with pytest.raises(ModError, match="isn't banned"):
+        await mod.unban(staff.services, GUILD, ACTOR, TARGET, None)
+    assert [c[1] for c in await cases(staff)] == ["ban", "unban"]
+
+
+# --------------------------------------------------------------- purge
+
+
+async def test_purge(staff: App, fake: FakeDiscord, clock: Any) -> None:
+    fake.add_user_message(CHANNEL, TARGET, at=clock.now() - timedelta(days=15))
+    fake.add_user_message(CHANNEL, TARGET, pinned=True)
+    for _ in range(3):
+        fake.add_user_message(CHANNEL, TARGET)
+        fake.add_user_message(CHANNEL, 12)
+    message = await mod.purge(staff.services, GUILD, ACTOR, CHANNEL, 50, TARGET)
+    assert "Deleted 3 message(s) from <@11>" in message
+    assert "1 older than 14 days" in message and "1 pinned" in message
+    case = await staff.repo.get_case(GUILD, 1)
+    assert case is not None and case.action == "purge" and case.target_id == TARGET
+    assert case.extra == {"channel_id": CHANNEL, "scanned": 50, "deleted": 3, "skipped_old": 1, "skipped_pinned": 1}
+    assert "Nothing to delete" in await mod.purge(staff.services, GUILD, ACTOR, CHANNEL, 50, TARGET)
+    assert len(await cases(staff)) == 1  # no case when nothing was deleted
+    assert "Deleted 3 message(s)." in await mod.purge(staff.services, GUILD, ACTOR, CHANNEL, 3, None)
+    with pytest.raises(ModError):
+        await mod.purge(staff.services, GUILD, ACTOR, CHANNEL, 101, None)
+
+
+# ------------------------------------------------------- error messages
+
+
+def test_permission_errors_name_the_actual_permissions() -> None:
+    from discord import app_commands
+
+    one = describe_command_error(app_commands.MissingPermissions(["moderate_members"]))
+    assert one == "You need the **Timeout Members** permission to use this command."
+    two = describe_command_error(app_commands.MissingPermissions(["manage_messages", "read_message_history"]))
+    assert two == "You need the **Manage Messages** and **Read Message History** permissions to use this command."
+    bot = describe_command_error(app_commands.BotMissingPermissions(["ban_members"]))
+    assert bot is not None and bot.startswith("I'm missing the **Ban Members** permission")
+    assert "Manage Server" in (describe_command_error(app_commands.MissingPermissions(["manage_guild"])) or "")
+    transformer = app_commands.transformers.MemberTransformer()
+    error = app_commands.TransformerError(object(), discord.AppCommandOptionType.user, transformer)
+    assert describe_command_error(error) == "That user isn't a member of this server."
+    assert describe_command_error(app_commands.AppCommandError("boom")) is None
+
+
+# ------------------------------------------------------------- commands
+
+
+async def _mod_tree(services: Any) -> tuple[discord.Client, Any]:
+    from discord import app_commands
+
+    from bot.commands.admin import register_admin_commands
+    from bot.commands.moderation import register_moderation_commands
+
+    client = discord.Client(intents=discord.Intents.none())
+    tree = app_commands.CommandTree(client)
+    register_admin_commands(tree, services)
+    register_moderation_commands(tree, services)
+    return client, tree
+
+
+EXPECTED_PERMS = {
+    "timeout": ("moderate_members",), "untimeout": ("moderate_members",), "warn": ("moderate_members",),
+    "warnings": ("moderate_members",), "clearwarn": ("moderate_members",), "clearwarns": ("moderate_members",),
+    "kick": ("kick_members",), "ban": ("ban_members",), "unban": ("ban_members",),
+    "purge": ("manage_messages", "read_message_history"), "modlog": ("manage_guild",),
+}
+BOT_CHECKED = {"timeout", "untimeout", "kick", "ban", "unban", "purge"}
+
+
+async def test_moderation_commands_are_gated_twice(app: App) -> None:
+    from discord import app_commands
+
+    client, tree = await _mod_tree(app.services)
+    try:
+        commands = {c.name: c for c in tree.get_commands()}
+        assert set(EXPECTED_PERMS) <= set(commands)
+        for name, perms in EXPECTED_PERMS.items():
+            command = commands[name]
+            assert command.guild_only, name
+            assert command.default_permissions == discord.Permissions(**{p: True for p in perms}), name
+            leaves = command.commands if isinstance(command, app_commands.Group) else [command]
+            for leaf in leaves:
+                assert leaf.checks, f"{name} has no runtime permission check"
+                expected = 2 if name in BOT_CHECKED else 1  # user check (+ bot check)
+                assert len(leaf.checks) == expected, name
+        modlog = commands["modlog"]
+        assert isinstance(modlog, app_commands.Group) and {c.name for c in modlog.commands} == {"set", "clear"}
+        duration = commands["timeout"].get_parameter("duration")  # type: ignore[union-attr]
+        assert duration.required
+        reason = commands["kick"].get_parameter("reason")  # type: ignore[union-attr]
+        assert not reason.required and reason.max_value == mod.REASON_MAX
+        amount = commands["purge"].get_parameter("amount")  # type: ignore[union-attr]
+        assert (amount.min_value, amount.max_value) == (1, 100)
+        days = commands["ban"].get_parameter("delete_message_days")  # type: ignore[union-attr]
+        assert (days.min_value, days.max_value, days.default) == (0, 7, 0)
+        assert tree.get_command("timeout").to_dict(tree)  # type: ignore[union-attr]  # serialises for sync
+    finally:
+        await client.close()
+
+
+class _Response:
+    def __init__(self) -> None:
+        self.deferred: list[dict[str, Any]] = []
+        self.sent: list[str] = []
+
+    def is_done(self) -> bool:
+        return bool(self.deferred or self.sent)
+
+    async def defer(self, **kwargs: Any) -> None:
+        self.deferred.append(kwargs)
+
+    async def send_message(self, message: str, ephemeral: bool) -> None:
+        assert ephemeral
+        self.sent.append(message)
+
+
+def _interaction(user_id: int = MOD) -> Any:
+    followups: list[str] = []
+
+    async def followup_send(message: str, ephemeral: bool) -> None:
+        assert ephemeral
+        followups.append(message)
+
+    return SimpleNamespace(
+        guild_id=GUILD, guild=SimpleNamespace(id=GUILD, name="Test Server"), channel_id=CHANNEL,
+        user=SimpleNamespace(id=user_id, name="mod"), response=_Response(),
+        followup=SimpleNamespace(send=followup_send), followups=followups,
+    )
+
+
+async def test_command_callbacks_defer_and_reply_ephemerally(staff: App, fake: FakeDiscord) -> None:
+    client, tree = await _mod_tree(staff.services)
+    try:
+        timeout_cmd = tree.get_command("timeout")
+        bad = _interaction()
+        await timeout_cmd.callback(bad, SimpleNamespace(id=TARGET), "soon", None)  # type: ignore[union-attr]
+        assert "Use a duration like" in bad.response.sent[0] and not bad.response.deferred
+        good = _interaction()
+        await timeout_cmd.callback(good, SimpleNamespace(id=TARGET), "10m", "spam")  # type: ignore[union-attr]
+        assert good.response.deferred == [{"ephemeral": True, "thinking": True}]
+        assert "timed out until" in good.followups[0]
+        refused = _interaction()
+        await tree.get_command("kick").callback(refused, SimpleNamespace(id=OWNER), None)  # type: ignore[union-attr]
+        assert "server owner" in refused.followups[0]
+        unban = _interaction()
+        await tree.get_command("unban").callback(unban, "not-an-id", None)  # type: ignore[union-attr]
+        assert "isn't a valid user ID" in unban.response.sent[0]
+    finally:
+        await client.close()

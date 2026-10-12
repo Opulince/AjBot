@@ -24,6 +24,19 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 PeriodChoice = Literal["daily", "weekly", "monthly"]
+# Discord's UI names for the permissions our commands check (the API names differ).
+PERMISSION_LABELS = {
+    "manage_guild": "Manage Server",
+    "moderate_members": "Timeout Members",
+    "kick_members": "Kick Members",
+    "ban_members": "Ban Members",
+    "manage_messages": "Manage Messages",
+    "read_message_history": "Read Message History",
+    "view_channel": "View Channels",
+    "send_messages": "Send Messages",
+    "embed_links": "Embed Links",
+    "manage_roles": "Manage Roles",
+}
 MAX_URL_LENGTH = 2048
 _BLOCKED_HOST_SUFFIXES = (".localhost", ".local", ".internal", ".lan", ".home", ".arpa")
 
@@ -164,6 +177,36 @@ def describe_forced_run(run: ResetRun) -> str:
         + "(a test run that can't be computed within a few minutes is closed without a winner)."
         + detail
     )
+
+
+def permission_list(names: list[str]) -> str:
+    """``["kick_members", "ban_members"]`` -> ``**Kick Members** and **Ban Members**``."""
+    labels = [f"**{PERMISSION_LABELS.get(n, n.replace('_', ' ').title())}**" for n in names]
+    if len(labels) <= 1:
+        return "".join(labels)
+    return ", ".join(labels[:-1]) + " and " + labels[-1]
+
+
+def describe_command_error(error: app_commands.AppCommandError) -> str | None:
+    """User-facing text for an expected command error, or ``None`` for an unexpected one."""
+    if isinstance(error, app_commands.MissingPermissions):
+        names = list(error.missing_permissions)
+        plural = "s" if len(names) > 1 else ""
+        return f"You need the {permission_list(names)} permission{plural} to use this command."
+    if isinstance(error, app_commands.BotMissingPermissions):
+        names = list(error.missing_permissions)
+        plural = "s" if len(names) > 1 else ""
+        return (
+            f"I'm missing the {permission_list(names)} permission{plural} here, so I can't do that. "
+            "Ask an admin to grant it (server-wide or in this channel)."
+        )
+    if isinstance(error, app_commands.NoPrivateMessage):
+        return "This command only works inside a server."
+    if isinstance(error, app_commands.CheckFailure):
+        return "You can't use this command here."
+    if isinstance(error, app_commands.TransformerError) and error.type is discord.AppCommandOptionType.user:
+        return "That user isn't a member of this server."
+    return None
 
 
 # ----------------------------------------------------------------- commands
@@ -331,13 +374,8 @@ def register_admin_commands(tree: app_commands.CommandTree, services: "Services"
 
     @tree.error
     async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
-        if isinstance(error, app_commands.MissingPermissions):
-            message = "You need the **Manage Server** permission to use this command."
-        elif isinstance(error, app_commands.NoPrivateMessage):
-            message = "This command only works inside a server."
-        elif isinstance(error, app_commands.CheckFailure):
-            message = "You can't use this command here."
-        else:
+        message = describe_command_error(error)
+        if message is None:
             command = interaction.command.qualified_name if interaction.command else "?"
             log.error("Slash command /%s failed in guild %s", command, interaction.guild_id, exc_info=error)
             message = "Something went wrong while running that command. The error has been logged."
