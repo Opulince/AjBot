@@ -129,6 +129,33 @@ class ChannelInfo:
         return {i for i in (self.channel_id, self.parent_id, self.category_id) if i is not None}
 
 
+RoleRank = tuple[int, int]
+"""Sortable role-hierarchy key: ``(position, -role_id)``.
+
+Discord breaks position ties by role ID (the lower ID ranks higher), exactly
+like ``discord.Role.__lt__``. Role IDs are unique, so two ranks are equal only
+for the same role — "strictly above" is a plain ``>``.
+"""
+
+
+@dataclass(frozen=True)
+class MemberRank:
+    """What moderation needs to know about a member, fetched fresh from Discord."""
+
+    user_id: int
+    top_role: RoleRank
+    owner: bool
+    administrator: bool
+    timed_out_until: datetime | None = None
+
+
+@dataclass(frozen=True)
+class PurgeResult:
+    deleted: int
+    skipped_old: int = 0
+    skipped_pinned: int = 0
+
+
 @dataclass(frozen=True)
 class RoleCheck:
     ok: bool
@@ -208,6 +235,46 @@ class DiscordOps(ABC):
     async def member_has_role(self, guild_id: int, user_id: int, role_id: int) -> bool:
         member = await self.fetch_member(guild_id, user_id)
         return role_id in member.role_ids
+
+    # ---------------------------------------------------------- moderation
+
+    @abstractmethod
+    async def member_rank(self, guild_id: int, user_id: int) -> MemberRank:
+        """Fresh hierarchy facts for a member (also the bot itself). :class:`OpNotFound` if not a member.
+
+        Always fetched from the API: without the Members intent cached members
+        never receive role updates, so a cached top role could be stale.
+        """
+
+    @abstractmethod
+    async def timeout_member(self, guild_id: int, user_id: int, until: datetime | None, *, reason: str) -> None:
+        """Time a member out until ``until``; ``None`` removes the timeout."""
+
+    @abstractmethod
+    async def kick_member(self, guild_id: int, user_id: int, *, reason: str) -> None: ...
+
+    @abstractmethod
+    async def ban_user(self, guild_id: int, user_id: int, *, delete_message_seconds: int, reason: str) -> None:
+        """Ban a user (member or not). Banning someone already banned succeeds."""
+
+    @abstractmethod
+    async def unban_user(self, guild_id: int, user_id: int, *, reason: str) -> None:
+        """Lift a ban. :class:`OpNotFound` (``Unknown Ban``) if the user is not banned."""
+
+    @abstractmethod
+    async def purge(
+        self, channel_id: int, *, limit: int, author_id: int | None, not_before: datetime, reason: str
+    ) -> PurgeResult:
+        """Bulk-delete among the newest ``limit`` messages.
+
+        Only messages by ``author_id`` (if given), created at or after
+        ``not_before`` (Discord refuses to bulk-delete messages older than 14
+        days) and not pinned are deleted; the skipped ones are counted.
+        """
+
+    @abstractmethod
+    async def dm_user(self, user_id: int, *, content: str | None = None, embed: discord.Embed | None = None) -> bool:
+        """Send a direct message. ``False`` if the user doesn't accept DMs from the bot (closed DMs)."""
 
 
 # --------------------------------------------------------------------- helpers
@@ -461,6 +528,84 @@ class DiscordPyOps(DiscordOps):
                 category_id = getattr(parent, "category_id", None)
                 return ChannelInfo(channel.id, channel.parent_id, category_id)
             return ChannelInfo(channel.id, None, getattr(channel, "category_id", None))
+
+    async def member_rank(self, guild_id: int, user_id: int) -> MemberRank:
+        with translate_errors("member_rank"):
+            guild = await self._guild(guild_id)
+            member = await guild.fetch_member(user_id)
+        return rank_of(member)
+
+    async def timeout_member(self, guild_id: int, user_id: int, until: datetime | None, *, reason: str) -> None:
+        stamp = ensure_utc(until).isoformat() if until is not None else None
+        with translate_errors("timeout_member"):
+            await self._client.http.edit_member(guild_id, user_id, reason=reason, communication_disabled_until=stamp)
+
+    async def kick_member(self, guild_id: int, user_id: int, *, reason: str) -> None:
+        with translate_errors("kick_member"):
+            await self._client.http.kick(user_id, guild_id, reason=reason)
+
+    async def ban_user(self, guild_id: int, user_id: int, *, delete_message_seconds: int, reason: str) -> None:
+        with translate_errors("ban_user"):
+            await self._client.http.ban(user_id, guild_id, delete_message_seconds, reason=reason)
+
+    async def unban_user(self, guild_id: int, user_id: int, *, reason: str) -> None:
+        with translate_errors("unban_user"):
+            await self._client.http.unban(user_id, guild_id, reason=reason)
+
+    async def purge(
+        self, channel_id: int, *, limit: int, author_id: int | None, not_before: datetime, reason: str
+    ) -> PurgeResult:
+        # Snowflakes are time-ordered, so "too old to bulk delete" is an ID comparison.
+        minimum_id = discord.utils.time_snowflake(ensure_utc(not_before))
+        to_delete: list[int] = []
+        skipped_old = skipped_pinned = 0
+        with translate_errors("purge"):
+            channel = self._messageable(channel_id)
+            async for msg in channel.history(limit=limit):
+                if author_id is not None and msg.author.id != author_id:
+                    continue
+                if not msg.type.is_deletable():
+                    continue
+                if msg.pinned:
+                    skipped_pinned += 1
+                    continue
+                if msg.id < minimum_id:
+                    skipped_old += 1
+                    continue
+                to_delete.append(msg.id)
+            if len(to_delete) == 1:
+                await self._client.http.delete_message(channel_id, to_delete[0], reason=reason)
+            elif to_delete:
+                await self._client.http.delete_messages(channel_id, to_delete, reason=reason)
+        return PurgeResult(len(to_delete), skipped_old, skipped_pinned)
+
+    async def dm_user(self, user_id: int, *, content: str | None = None, embed: discord.Embed | None = None) -> bool:
+        kwargs: dict = {"allowed_mentions": discord.AllowedMentions.none()}
+        if content is not None:
+            kwargs["content"] = content
+        if embed is not None:
+            kwargs["embed"] = embed
+        try:
+            with translate_errors("dm_user"):
+                channel = await self._client.create_dm(discord.Object(id=user_id))
+                await channel.send(**kwargs)
+        except OpForbidden:
+            return False  # 50007: the user has DMs from server members closed (or blocked the bot)
+        return True
+
+
+def role_rank(role: discord.Role) -> RoleRank:
+    return (role.position, -role.id)
+
+
+def rank_of(member: discord.Member) -> MemberRank:
+    return MemberRank(
+        user_id=member.id,
+        top_role=role_rank(member.top_role),
+        owner=member.guild.owner_id == member.id,
+        administrator=member.guild_permissions.administrator,
+        timed_out_until=member.timed_out_until,
+    )
 
 
 def evaluate_role_manageable(guild: discord.Guild, role: discord.Role) -> RoleCheck:
