@@ -114,6 +114,7 @@ class FakeMessage:
     created_at: datetime
     edits: int = 0
     pinned: bool = False
+    mentions: tuple[int, ...] = ()  # user IDs the send was allowed to ping
 
     @property
     def footer(self) -> str:
@@ -326,6 +327,7 @@ class FakeDiscord(DiscordOps):
                 embed=embed.to_dict() if embed is not None else None,
                 components=_custom_ids(view),
                 created_at=self.clock.now(),
+                mentions=tuple(mention_user_ids),
             )
             self.channels[channel_id].append(msg)
         self._after("send_message")
