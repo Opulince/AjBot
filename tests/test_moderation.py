@@ -1501,3 +1501,98 @@ async def test_leaderboard_commands_need_manage_server(app: App) -> None:
         assert (seconds.min_value, seconds.max_value) == (0, 60)
     finally:
         await client.close()
+
+
+# ========================================================== staff-role gate
+
+STAFF_ROLES = (1343413837101011047, 1343265536141688964, 1534411578378682519)
+
+
+def test_staff_roles_config() -> None:
+    from bot.config import ConfigError, load_config
+
+    base = {"DISCORD_TOKEN": "fake.token"}
+    assert load_config(base).staff_role_ids == STAFF_ROLES  # the server's three staff roles by default
+    assert load_config({**base, "STAFF_ROLE_IDS": "123456789012345678, 223456789012345678"}).staff_role_ids == (
+        123456789012345678, 223456789012345678,
+    )
+    assert load_config({**base, "STAFF_ROLE_IDS": "off"}).staff_role_ids == ()
+    with pytest.raises(ConfigError, match="STAFF_ROLE_IDS"):
+        load_config({**base, "STAFF_ROLE_IDS": "mods"})
+
+
+def test_only_staff_roles_or_the_owner_pass() -> None:
+    from discord import app_commands
+
+    from bot.commands.staff import NotStaff, is_staff, staff_check
+
+    def member(user_id: int, *roles: int) -> Any:
+        return SimpleNamespace(id=user_id, roles=[SimpleNamespace(id=r) for r in roles])
+
+    assert is_staff(member(1, 5, STAFF_ROLES[2]), 99, STAFF_ROLES)
+    assert not is_staff(member(1, 5), 99, STAFF_ROLES)
+    assert is_staff(member(99), 99, STAFF_ROLES)  # the owner can never be locked out
+    assert is_staff(member(1), 99, ())  # gate off
+    check = staff_check(STAFF_ROLES)
+    guild = SimpleNamespace(owner_id=99)
+    assert check(SimpleNamespace(guild=guild, user=member(1, STAFF_ROLES[0]))) is True
+    with pytest.raises(NotStaff):
+        check(SimpleNamespace(guild=guild, user=member(1, 5)))
+    assert issubclass(NotStaff, app_commands.CheckFailure)
+    assert describe_command_error(NotStaff("x")) == "Only staff can use this command."
+
+
+async def test_gate_covers_every_command_except_stats(app: App) -> None:
+    from discord import app_commands
+
+    from bot.commands.staff import NotStaff, apply_staff_gate
+    from bot.commands.stats import register_stats_command
+
+    client, tree = await _mod_tree(app.services)
+    register_stats_command(tree, app.services)
+    try:
+        gated = apply_staff_gate(tree, STAFF_ROLES)
+        leaves: list[Any] = []
+        for command_type in (discord.AppCommandType.chat_input, discord.AppCommandType.user,
+                             discord.AppCommandType.message):
+            for command in tree.get_commands(type=command_type):
+                if isinstance(command, app_commands.Group):
+                    leaves += [c for c in command.walk_commands() if isinstance(c, app_commands.Command)]
+                else:
+                    leaves.append(command)
+        public = [c for c in leaves if c.name == "stats"]
+        staff = [c for c in leaves if c.name != "stats"]
+        assert gated == len(staff) and len(staff) > 30
+        assert not any(getattr(f, "__qualname__", "").startswith("staff_check") for c in public for f in c.checks)
+        for command in staff:
+            gate = command.checks[-1]
+            outsider = SimpleNamespace(guild=SimpleNamespace(owner_id=99), user=SimpleNamespace(id=1, roles=[]))
+            with pytest.raises(NotStaff):
+                gate(outsider)
+        assert apply_staff_gate(tree, ()) == 0
+    finally:
+        await client.close()
+
+
+async def test_gate_blocks_a_real_slash_command_before_it_runs(staff: App, fake: FakeDiscord) -> None:
+    from bot.commands.staff import NotStaff, apply_staff_gate
+
+    client, tree = await _mod_tree(staff.services)
+    try:
+        apply_staff_gate(tree, STAFF_ROLES)
+        kick = tree.get_command("kick")
+        outsider = _interaction()
+        outsider.user = SimpleNamespace(id=MOD, name="mod", roles=[SimpleNamespace(id=ROLE_MOD)])
+        outsider.guild = SimpleNamespace(id=GUILD, name="S", owner_id=OWNER)
+        outsider.permissions = discord.Permissions(kick_members=True)  # has the permission, not the role
+        outsider.app_permissions = discord.Permissions(kick_members=True)
+        with pytest.raises(NotStaff):
+            await kick._check_can_run(outsider)  # type: ignore[union-attr]
+        insider = _interaction()
+        insider.user = SimpleNamespace(id=MOD, name="mod", roles=[SimpleNamespace(id=STAFF_ROLES[1])])
+        insider.guild = SimpleNamespace(id=GUILD, name="S", owner_id=OWNER)
+        insider.permissions = discord.Permissions(kick_members=True)
+        insider.app_permissions = discord.Permissions(kick_members=True)
+        assert await kick._check_can_run(insider) is True  # type: ignore[union-attr]
+    finally:
+        await client.close()

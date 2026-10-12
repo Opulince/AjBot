@@ -185,6 +185,7 @@ cp .env.example .env
 | `BOARD_UPDATE_SECONDS` | no | `300` | How often the boards are edited (60–86400). |
 | `LOG_DIR` | no | `logs` | Directory for the rotating log file `leaderboard.log`. |
 | `LOG_LEVEL` | no | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`. Applies to discord.py's own log lines too. |
+| `STAFF_ROLE_IDS` | no | the server's 3 staff roles | Comma-separated role IDs. Only members with one of these roles (or the server owner) can use any command except `/stats`, on top of each command's permission. `off` removes the role gate. |
 
 Configuration is validated at startup. Any missing or invalid value stops the bot immediately with
 a message listing every problem (exit code 2). This includes storage: the database and log
@@ -310,7 +311,13 @@ The SQLite file is the only state. Losing it loses all history, configuration an
 
 All administrative commands require **Manage Server**. They are hidden from members without it
 (`default_permissions`) and also checked at runtime, because server admins can override command
-visibility per role. Responses are ephemeral. Moderation commands are listed in
+visibility per role. Responses are ephemeral.
+
+**Staff roles.** On top of that, every command except `/stats` (slash commands and right-click
+menus) only works for members who have one of the roles in `STAFF_ROLE_IDS`
+(`1343413837101011047`, `1343265536141688964`, `1534411578378682519` by default). The server owner
+always can, so a wrong ID can't lock the server out. Everyone else gets "Only staff can use this
+command." Moderation commands are listed in
 [Moderation](#moderation).
 
 | Command | What it does |
