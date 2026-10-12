@@ -40,7 +40,7 @@ from bot.discord_ops import (
     with_retries,
 )
 from bot.periods import unix_timestamp
-from bot.ui.modlog import build_case_embed, build_info_embed, clip
+from bot.ui.modlog import build_case_embed, build_info_embed, clip, format_duration
 
 if TYPE_CHECKING:
     from bot.main import Services
@@ -229,7 +229,7 @@ async def post_modlog(services: "Services", guild_id: int, embed: discord.Embed)
     return channel_id, message_id
 
 
-def case_embed(case: ModCase, *, note: str | None = None) -> discord.Embed:
+def case_embed(case: ModCase) -> discord.Embed:
     return build_case_embed(
         case_id=case.case_id,
         action=case.action,
@@ -239,12 +239,11 @@ def case_embed(case: ModCase, *, note: str | None = None) -> discord.Embed:
         duration_seconds=case.duration_seconds,
         created_at=case.created_at,
         extra=case.extra,
-        note=note,
     )
 
 
-async def log_case(services: "Services", case: ModCase, *, note: str | None = None) -> None:
-    posted = await post_modlog(services, case.guild_id, case_embed(case, note=note))
+async def log_case(services: "Services", case: ModCase) -> None:
+    posted = await post_modlog(services, case.guild_id, case_embed(case))
     if posted is None:
         return
     try:
@@ -263,7 +262,6 @@ async def record_case(
     reason: str | None,
     duration_seconds: int | None = None,
     extra: Mapping[str, Any] | None = None,
-    note: str | None = None,
 ) -> ModCase | None:
     """Write the case for an action that already happened on Discord, then log it.
 
@@ -283,11 +281,11 @@ async def record_case(
         )
         embed = build_case_embed(
             case_id=None, action=action, target_id=target_id, moderator_id=actor.user_id, reason=reason,
-            duration_seconds=duration_seconds, created_at=now, extra=extra, note=note,
+            duration_seconds=duration_seconds, created_at=now, extra=extra,
         )
         await post_modlog(services, guild_id, embed)
         return None
-    await log_case(services, case, note=note)
+    await log_case(services, case)
     return case
 
 
@@ -296,7 +294,7 @@ async def record_case(
 
 async def apply_timeout(
     services: "Services", guild_id: int, actor: Actor, target_id: int, duration: timedelta, reason: str | None,
-    *, note: str | None = None,
+    *, extra: Mapping[str, Any] | None = None,
 ) -> tuple[datetime, ModCase | None]:
     """Checks, Discord timeout and case. Returns ``(until, case)``; raises :class:`ModError` if refused."""
     if duration <= timedelta(0) or duration > MAX_TIMEOUT:
@@ -312,7 +310,7 @@ async def apply_timeout(
     )
     case = await record_case(
         services, guild_id, "timeout", target_id=target_id, actor=actor, reason=reason,
-        duration_seconds=int(duration.total_seconds()), note=note,
+        duration_seconds=int(duration.total_seconds()), extra=extra,
     )
     return until, case
 
@@ -347,22 +345,94 @@ async def _notify(services: "Services", user_id: int, content: str) -> bool:
 
 
 async def warn(
-    services: "Services", guild_id: int, guild_name: str, actor: Actor, target_id: int, reason: str
+    services: "Services",
+    guild_id: int,
+    guild_name: str,
+    actor: Actor,
+    target_id: int,
+    reason: str,
+    *,
+    extra: Mapping[str, Any] | None = None,
 ) -> str:
+    """Warn a member: DM them (the Discord part, best effort), record the case, then escalate.
+
+    A DM that can't be delivered never fails the warning. When the new active
+    count matches a ``/warnconfig`` threshold, an automatic timeout follows as
+    its own case; if it isn't possible the warning still stands and the reason
+    is reported here and in the mod log.
+    """
     await check_target(services, guild_id, actor, target_id, verb="warn", bot_acts=False)
+    server = discord.utils.escape_markdown(guild_name)
+    delivered = await _notify(services, target_id, clip(f"You received a warning in **{server}**.\nReason: {reason}", 2000))
     try:
         case, active = await services.repo.create_warning(
-            guild_id, target_id, moderator_id=actor.user_id, reason=reason, now=services.clock.now()
+            guild_id, target_id, moderator_id=actor.user_id, reason=reason, now=services.clock.now(),
+            extra={**(extra or {}), "dm": delivered},
         )
     except Exception as exc:
         log.exception("Could not save a warning for %s in guild %s", target_id, guild_id)
-        raise ModError("The warning couldn't be saved, so nothing was recorded. The error was logged.") from exc
-    server = discord.utils.escape_markdown(guild_name)
-    delivered = await _notify(services, target_id, clip(f"You received a warning in **{server}**.\nReason: {reason}", 2000))
-    dm_note = None if delivered else "DM not delivered (closed DMs or an error)."
-    await log_case(services, case, note=dm_note)
+        sent = " (they did get the DM)" if delivered else ""
+        raise ModError(f"The warning couldn't be saved{sent}, so it doesn't count. The error was logged.") from exc
+    await log_case(services, case)
     dm = "They were notified by DM." if delivered else "I couldn't DM them (closed DMs), but the warning is recorded."
-    return f"Warned <@{target_id}> (case #{case.case_id}). Active warnings: **{active}**. {dm}"
+    message = f"Warned <@{target_id}> (case #{case.case_id}). Active warnings: **{active}**. {dm}"
+    escalation = await escalate(services, guild_id, actor, target_id, active, case.case_id)
+    return f"{message}\n{escalation}" if escalation else message
+
+
+async def escalate(
+    services: "Services", guild_id: int, actor: Actor, target_id: int, active: int, warn_case_id: int
+) -> str | None:
+    """Apply the timeout configured for exactly ``active`` warnings, if any. Never raises."""
+    try:
+        seconds = await services.repo.get_warn_threshold(guild_id, active)
+    except Exception:
+        log.exception("Could not read the warn thresholds of guild %s", guild_id)
+        return "**Auto-timeout not checked:** the escalation rules couldn't be read (error logged)."
+    if seconds is None:
+        return None
+    length = format_duration(seconds)
+    try:
+        until, case = await apply_timeout(
+            services, guild_id, actor, target_id, timedelta(seconds=seconds), f"Auto: {active} warnings",
+            extra={"warn_case": warn_case_id},
+        )
+    except ModError as exc:
+        log.info("Auto-timeout for %s in guild %s not applied: %s", target_id, guild_id, exc)
+        await post_modlog(services, guild_id, build_info_embed(
+            "Auto-timeout not applied",
+            f"<@{target_id}> reached {active} warnings (warning #{warn_case_id}), which should time them out "
+            f"for {length}, but it wasn't possible: {exc}",
+            moderator_id=actor.user_id, created_at=services.clock.now(),
+        ))
+        return f"**Auto-timeout not applied** ({active} warnings → {length}): {exc}"
+    return f"That's {active} warnings, so they're timed out for {length} (until {_ts(until)}).{case_note(case)}"
+
+
+async def delete_and_warn(
+    services: "Services",
+    guild_id: int,
+    guild_name: str,
+    actor: Actor,
+    *,
+    channel_id: int,
+    message_id: int,
+    author_id: int,
+    content: str | None,
+    reason: str,
+) -> str:
+    """Delete one message, then warn its author (the warning records where and what it was)."""
+    await check_target(services, guild_id, actor, author_id, verb="warn", bot_acts=False)
+    try:
+        await with_retries(lambda: services.ops.delete_message(channel_id, message_id), name="delete_message")
+    except OpNotFound:
+        pass  # already deleted: the warning still applies
+    except OpError as exc:
+        raise discord_failure(exc, verb="delete the message of", target_id=author_id) from exc
+    excerpt = clip(discord.utils.escape_markdown(content.strip()), 300) if content and content.strip() else None
+    deleted = {"channel_id": channel_id, "message_id": message_id, "excerpt": excerpt}
+    message = await warn(services, guild_id, guild_name, actor, author_id, reason, extra={"deleted_message": deleted})
+    return f"Deleted the message. {message}"
 
 
 async def list_warnings(services: "Services", guild_id: int, user_id: int) -> str:
@@ -482,6 +552,71 @@ async def purge(
     }
     case = await record_case(services, guild_id, "purge", target_id=user_id, actor=actor, reason=None, extra=extra)
     return f"Deleted {result.deleted} message(s){who}.{tail}{case_note(case)}"
+
+
+# --------------------------------------------------------- warn escalation
+
+
+async def add_warn_threshold(services: "Services", guild_id: int, count: int, duration: timedelta) -> str:
+    if not 1 <= count <= 100:
+        raise ModError("The warning count must be between 1 and 100.")
+    if duration > MAX_TIMEOUT:
+        raise ModError("An automatic timeout can be at most 28 days (Discord's limit).")
+    seconds = int(duration.total_seconds())
+    await services.repo.set_warn_threshold(guild_id, count, seconds)
+    log.info("Warn threshold set: guild=%s count=%s timeout=%ss", guild_id, count, seconds)
+    return f"At exactly {count} active warning(s), members are timed out for {format_duration(seconds)}."
+
+
+async def remove_warn_threshold(services: "Services", guild_id: int, count: int) -> str:
+    if not await services.repo.remove_warn_threshold(guild_id, count):
+        raise ModError(f"There is no rule for {count} warning(s).")
+    return f"Removed the rule for {count} warning(s)."
+
+
+async def list_warn_thresholds(services: "Services", guild_id: int) -> str:
+    rules = await services.repo.list_warn_thresholds(guild_id)
+    if not rules:
+        return "No automatic timeouts are configured. Add one with `/warnconfig add`."
+    lines = [f"• {r.warn_count} warning(s) → timeout {format_duration(r.timeout_seconds)}" for r in rules]
+    return fit_lines("Automatic timeouts (when a member reaches exactly this many active warnings):", lines)
+
+
+# -------------------------------------------------------------------- cases
+
+
+def case_link(guild_id: int, case: ModCase) -> str | None:
+    if case.modlog_channel_id is None or case.modlog_message_id is None:
+        return None
+    return f"https://discord.com/channels/{guild_id}/{case.modlog_channel_id}/{case.modlog_message_id}"
+
+
+async def view_case(services: "Services", guild_id: int, case_id: int) -> discord.Embed:
+    case = await services.repo.get_case(guild_id, case_id)
+    if case is None:
+        raise ModError(f"There is no case #{case_id} in this server.")
+    embed = case_embed(case)
+    if case.action == "warn":
+        embed.add_field(name="Status", value="Active" if case.active else "Cleared", inline=True)
+    link = case_link(guild_id, case)
+    if link:
+        embed.add_field(name="Mod log", value=f"[Jump to entry]({link})", inline=True)
+    return embed
+
+
+async def edit_case_reason(services: "Services", guild_id: int, case_id: int, reason: str) -> str:
+    """Change a case's reason and re-render its mod-log entry (best effort)."""
+    case = await services.repo.update_case_reason(guild_id, case_id, reason)
+    if case is None:
+        raise ModError(f"There is no case #{case_id} in this server.")
+    if case.modlog_channel_id is None or case.modlog_message_id is None:
+        return f"Updated the reason of case #{case_id}. (It has no mod-log entry to edit.)"
+    try:
+        await services.ops.edit_message(case.modlog_channel_id, case.modlog_message_id, embed=case_embed(case))
+    except OpError as exc:
+        log.warning("Could not edit the mod-log entry of case #%s in guild %s: %s", case_id, guild_id, exc.describe())
+        return f"Updated the reason of case #{case_id}, but its mod-log entry couldn't be edited ({exc.kind})."
+    return f"Updated the reason of case #{case_id} and its mod-log entry."
 
 
 async def set_modlog(services: "Services", guild_id: int, channel_id: int | None) -> str:

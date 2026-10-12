@@ -1095,13 +1095,20 @@ class Repo:
             )
 
     async def create_warning(
-        self, guild_id: int, user_id: int, *, moderator_id: int, reason: str | None, now: datetime
+        self,
+        guild_id: int,
+        user_id: int,
+        *,
+        moderator_id: int,
+        reason: str | None,
+        now: datetime,
+        extra: Mapping[str, Any] | None = None,
     ) -> tuple[ModCase, int]:
         """Record a warning and return it with the user's active warning count (including it), atomically."""
         async with self.db.transaction() as conn:
             case = await self._insert_case(
                 conn, guild_id, "warn", target_id=user_id, moderator_id=moderator_id, reason=reason,
-                now=now, duration_seconds=None, extra=None,
+                now=now, duration_seconds=None, extra=extra,
             )
             row = await _fetchone(
                 conn,
