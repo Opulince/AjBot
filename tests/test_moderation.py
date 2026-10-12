@@ -16,8 +16,9 @@ from bot.clock import UTC
 from bot.commands.admin import describe_command_error
 from bot.discord_ops import DiscordPyOps, MemberRank, OpForbidden, OpNetwork, PurgeResult, rank_of, role_rank
 from bot.moderation import Actor, ModError
-from tests.conftest import CHANNEL, GUILD, T0
+from tests.conftest import CHANNEL, GUILD, T0, install
 from tests.fakes import App, FakeDiscord, snowflake_at
+from tests.test_counting import World
 
 MOD = 20
 TARGET = 11
@@ -1242,3 +1243,261 @@ async def test_scheduler_loop_runs_resets_and_unbans(tmp_path: Any, fake: FakeDi
         assert order == ["resets", "unbans"]
     finally:
         await bot.close()
+
+
+# ============================================ leaderboard bans and resets (B)
+
+
+@pytest.fixture
+async def world() -> Any:
+    w = World()
+    yield w
+    await w.client.close()
+
+
+async def totals(app: App, board: str = "alltime") -> dict[int, int]:
+    entries = await app.services.ranker.board_ranking(GUILD, board, app.services.clock.now(), limit=None)
+    return {e.user_id: e.count for e in entries}
+
+
+async def test_lbban_hides_everywhere_and_unban_restores(staff: App, fake: FakeDiscord, clock: Any, world: World) -> None:
+    from bot.commands.stats import user_standings
+
+    await install(staff, roles=False)
+    await staff.messages(GUILD, TARGET, dt(2026, 3, 10, 12, 30), 5)
+    await staff.messages(GUILD, 12, dt(2026, 3, 10, 12, 30), 2)
+    message = await mod.lb_ban(staff.services, GUILD, ACTOR, TARGET, "alt farming")
+    assert "banned from the leaderboard" in message and "Case #1." in message
+    assert await totals(staff) == {12: 2}
+    daily = next(m for m in fake.board_messages(CHANNEL) if m.board[1] == "daily")
+    assert f"<@{TARGET}>" not in daily.embed["description"] and "<@12>" in daily.embed["description"]  # refreshed now
+    standing = (await user_standings(staff.services, GUILD, TARGET))["alltime"]
+    assert (standing.rank, standing.count) == (None, 0)
+    # New messages while banned are not counted at all.
+    assert await staff.services.counter.handle(world.message(world.text, author_id=TARGET, seq=7)) is False
+    assert await staff.services.counter.handle(world.message(world.text, author_id=12, seq=8)) is True
+    with pytest.raises(ModError, match="already banned"):
+        await mod.lb_ban(staff.services, GUILD, ACTOR, TARGET, None)
+    assert "<@11> (`11`)" in await mod.list_lb_bans(staff.services, GUILD)
+    assert "back on the leaderboard" in await mod.lb_unban(staff.services, GUILD, ACTOR, TARGET, None)
+    assert await staff.buffer.flush()
+    assert await totals(staff) == {TARGET: 5, 12: 3}  # earlier counts restored, banned-time messages not counted
+    with pytest.raises(ModError, match="isn't banned"):
+        await mod.lb_unban(staff.services, GUILD, ACTOR, TARGET, None)
+    assert [c[1] for c in await cases(staff)] == ["lbban", "lbunban"]
+    assert "Nobody is banned" in await mod.list_lb_bans(staff.services, GUILD)
+
+
+async def test_lbbanned_user_can_never_win(staff: App, fake: FakeDiscord, clock: Any) -> None:
+    await install(staff)
+    await staff.messages(GUILD, TARGET, dt(2026, 3, 10, 13), 9)
+    await staff.messages(GUILD, 12, dt(2026, 3, 10, 13), 2)
+    await mod.lb_ban(staff.services, GUILD, ACTOR, TARGET, None)
+    clock.set(dt(2026, 3, 11, 0, 3))
+    await staff.runner.tick()
+    run = await staff.repo.get_run_by_key(GUILD, "daily", "2026-03-10")
+    assert run is not None and (run.winner_user_id, run.winner_count) == (12, 2)
+    assert fake.holders_of(GUILD, 501) == {12}
+    assert "<@12>" in fake.previous_field(CHANNEL, "daily")
+
+
+async def test_lbban_rules_and_restart(staff: App, fake: FakeDiscord, clock: Any, config: Any, world: World) -> None:
+    with pytest.raises(ModError, match="server owner"):
+        await mod.lb_ban(staff.services, GUILD, ACTOR, OWNER, None)
+    fake.guilds[GUILD].members[TARGET].roles.add(ROLE_MOD)
+    with pytest.raises(ModError, match="below yours"):
+        await mod.lb_ban(staff.services, GUILD, ACTOR, TARGET, None)
+    assert "banned from the leaderboard" in await mod.lb_ban(staff.services, GUILD, ACTOR, 4242, None)  # left the server
+    await staff.shutdown()
+    app = await App.start(config, fake, clock)
+    await install(app, roles=False)
+    assert app.services.lb_bans.is_banned(GUILD, 4242)  # the cache is rebuilt at startup
+    assert await app.services.counter.handle(world.message(world.text, author_id=4242)) is False
+
+
+async def test_reset_counts_scopes_and_flushes_the_buffer_first(staff: App, clock: Any) -> None:
+    await install(staff, roles=False)
+    await staff.messages(GUILD, TARGET, dt(2026, 3, 2, 12), 4)   # previous week, this month
+    await staff.messages(GUILD, TARGET, dt(2026, 3, 9, 12), 3)   # this week (Mon), yesterday
+    await staff.messages(GUILD, TARGET, dt(2026, 3, 10, 12, 30), 2)  # today
+    staff.record(GUILD, TARGET, dt(2026, 3, 10, 12, 40))  # still only in memory
+    await staff.messages(GUILD, 12, dt(2026, 3, 10, 12, 30), 1)
+    message = await mod.reset_counts(staff.services, GUILD, ACTOR, TARGET, "weekly")
+    assert "weekly (2026-W11)" in message and "2 day(s)" in message
+    assert await staff.buffer.flush()
+    assert (await totals(staff))[TARGET] == 4  # the buffered message didn't come back
+    assert (await totals(staff, "weekly")).get(TARGET) is None
+    case = await staff.repo.get_case(GUILD, 1)
+    assert case is not None and case.action == "resetcounts" and case.extra == {"period": "weekly (2026-W11)", "deleted_days": 1 + 1}
+    assert "nothing to reset" in await mod.reset_counts(staff.services, GUILD, ACTOR, TARGET, "daily")
+    assert "all-time" in await mod.reset_counts(staff.services, GUILD, ACTOR, TARGET, "alltime")
+    assert await totals(staff) == {12: 1}
+
+
+async def test_reset_counts_refuses_when_the_buffer_cannot_flush(
+    staff: App, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await install(staff, roles=False)
+    await staff.messages(GUILD, TARGET, dt(2026, 3, 10, 12, 30), 3)
+
+    async def failing_flush() -> bool:
+        return False
+
+    monkeypatch.setattr(staff.buffer, "flush", failing_flush)
+    with pytest.raises(ModError, match="nothing was reset"):
+        await mod.reset_counts(staff.services, GUILD, ACTOR, TARGET, "daily")
+    monkeypatch.undo()
+    assert (await totals(staff))[TARGET] == 3 and await cases(staff) == []
+    with pytest.raises(ModError, match="server owner"):
+        await mod.check_reset_counts(staff.services, GUILD, ACTOR, OWNER, "daily")
+    with pytest.raises(ModError, match="Pick daily"):
+        await mod.check_reset_counts(staff.services, GUILD, ACTOR, TARGET, "yearly")
+
+
+async def test_resetcounts_asks_for_confirmation(staff: App) -> None:
+    from bot.commands.moderation import ConfirmView
+
+    await install(staff, roles=False)
+    await staff.messages(GUILD, TARGET, dt(2026, 3, 10, 12, 30), 3)
+    client, tree = await _mod_tree(staff.services)
+    try:
+        sent: list[dict[str, Any]] = []
+        interaction = _interaction()
+
+        async def followup_send(message: str, **kwargs: Any) -> None:
+            sent.append({"message": message, **kwargs})
+
+        interaction.followup = SimpleNamespace(send=followup_send)
+        await tree.get_command("resetcounts").callback(interaction, SimpleNamespace(id=TARGET), "daily")  # type: ignore[union-attr]
+        prompt = sent[0]
+        assert "daily (2026-03-10)" in prompt["message"] and "can't be undone" in prompt["message"]
+        assert prompt["ephemeral"] is True and isinstance(prompt["view"], ConfirmView)
+        assert (await totals(staff))[TARGET] == 3  # nothing happens before confirming
+        view: ConfirmView = prompt["view"]
+
+        edits: list[dict[str, Any]] = []
+
+        def click(user_id: int) -> Any:
+            async def edit_message(**kwargs: Any) -> None:
+                edits.append(kwargs)
+
+            async def edit_original_response(**kwargs: Any) -> None:
+                edits.append(kwargs)
+
+            async def send_message(message: str, ephemeral: bool) -> None:
+                edits.append({"denied": message})
+
+            return SimpleNamespace(
+                user=SimpleNamespace(id=user_id),
+                response=SimpleNamespace(edit_message=edit_message, send_message=send_message),
+                edit_original_response=edit_original_response,
+            )
+
+        stranger = click(12)
+        assert await view.interaction_check(stranger) is False
+        assert "Only the moderator" in edits.pop()["denied"]
+        await view.confirm.callback(click(MOD))
+        assert edits[0] == {"content": "Resetting…", "view": None}
+        assert "Reset <@11>'s daily (2026-03-10) count" in edits[1]["content"]
+        assert TARGET not in await totals(staff) and view.is_finished()
+
+        other = ConfirmView(MOD, lambda: mod.reset_counts(staff.services, GUILD, ACTOR, 12, "daily"))
+        edits.clear()
+        await other.cancel.callback(click(MOD))
+        assert edits == [{"content": "Cancelled. Nothing was reset.", "view": None}]
+    finally:
+        await client.close()
+
+
+# ===================================================== count cooldown (A)
+
+
+def test_cooldown_tracker() -> None:
+    from bot.counting.filter import CooldownTracker
+
+    tracker = CooldownTracker(repo=None, max_users=2)  # type: ignore[arg-type]
+    t = dt(2026, 3, 10, 12)
+    assert tracker.allow(GUILD, 1, snowflake_at(t)) and tracker.allow(GUILD, 1, snowflake_at(t, 1))  # off by default
+    tracker.set_cooldown(GUILD, 5)
+    assert tracker.allow(GUILD, 1, snowflake_at(t))  # nothing tracked since enabling... the first one counts
+    assert not tracker.allow(GUILD, 1, snowflake_at(t + timedelta(seconds=4, milliseconds=999)))
+    assert tracker.allow(GUILD, 1, snowflake_at(t + timedelta(seconds=5)))
+    assert not tracker.allow(GUILD, 1, snowflake_at(t + timedelta(seconds=2)))  # late delivery inside the window
+    assert tracker.allow(GUILD, 1, snowflake_at(t - timedelta(seconds=30)))  # much older: counts...
+    assert not tracker.allow(GUILD, 1, snowflake_at(t + timedelta(seconds=9)))  # ...without moving "last" back
+    assert tracker.allow(GUILD, 2, snowflake_at(t)) and tracker.allow(OTHER_GUILD, 1, snowflake_at(t))  # per user/guild
+    assert tracker.allow(GUILD, 3, snowflake_at(t))  # LRU of 2: evicts the oldest entry (guild 1, user 1)
+    assert tracker.allow(GUILD, 1, snowflake_at(t + timedelta(seconds=6)))  # forgotten, so it counts
+    tracker.set_cooldown(GUILD, 0)
+    assert tracker.allow(GUILD, 1, snowflake_at(t + timedelta(seconds=6, milliseconds=1)))
+
+
+async def test_count_cooldown_drops_rapid_messages(staff: App, world: World, clock: Any, config: Any,
+                                                   fake: FakeDiscord) -> None:
+    await install(staff, roles=False)
+    counter = staff.services.counter
+    t = dt(2026, 3, 10, 12, 30)
+    assert "set to 10s" in await mod.set_count_cooldown(staff.services, GUILD, 10)
+    results = [
+        await counter.handle(world.message(world.text, created_at=t + timedelta(seconds=s), seq=i))
+        for i, s in enumerate((0, 3, 9, 10, 15, 21))
+    ]
+    assert results == [True, False, False, True, False, True]
+    other = world.message(world.text, author_id=12, created_at=t + timedelta(seconds=1), seq=50)
+    assert await counter.handle(other) is True  # cooldowns are per user
+    assert await counter.handle(world.message(world.text, created_at=t, seq=0)) is False  # duplicate delivery
+    assert await staff.buffer.flush()
+    assert (await totals(staff))[TARGET] == 3
+    # The setting persists; the last-counted times don't (documented).
+    await staff.shutdown()
+    app = await App.start(config, fake, clock)
+    assert app.services.cooldowns.cooldown(GUILD) == 10
+    assert await app.services.counter.handle(world.message(world.text, created_at=t + timedelta(seconds=22), seq=60))
+    assert "turned off" in await mod.set_count_cooldown(app.services, GUILD, 0)
+    assert await app.services.counter.handle(world.message(world.text, created_at=t + timedelta(seconds=23), seq=61))
+    with pytest.raises(ModError):
+        await mod.set_count_cooldown(app.services, GUILD, 61)
+
+
+async def test_concurrent_messages_inside_the_cooldown_count_once(staff: App, world: World, fake: FakeDiscord) -> None:
+    from bot.counting.filter import ChannelResolver, MessageCounter
+    from bot.discord_ops import ChannelInfo
+    from tests.test_counting import CATEGORY, TEXT
+
+    gate = asyncio.Event()
+    fake.channel_info[72] = ChannelInfo(72, TEXT, CATEGORY)
+
+    class SlowResolver(ChannelResolver):
+        async def resolve(self, guild_id: int, channel: Any) -> Any:
+            await gate.wait()
+            return await super().resolve(guild_id, channel)
+
+    await install(staff, roles=False)
+    await mod.set_count_cooldown(staff.services, GUILD, 10)
+    s = staff.services
+    counter = MessageCounter(s.exclusions, SlowResolver(fake), s.buffer, s.installs, s.lb_bans, s.cooldowns)
+    msgs = []
+    for i in range(5):
+        m = world.message(world.text, created_at=dt(2026, 3, 10, 12, 30, i), seq=i)
+        m.channel = world.client.get_partial_messageable(72, guild_id=GUILD)
+        msgs.append(m)
+    tasks = [asyncio.create_task(counter.handle(m)) for m in msgs]
+    await asyncio.sleep(0)
+    gate.set()
+    assert (await asyncio.gather(*tasks)).count(True) == 1
+
+
+async def test_leaderboard_commands_need_manage_server(app: App) -> None:
+    client, tree = await _mod_tree(app.services)
+    try:
+        for name in ("lbban", "lbunban", "lbbans", "resetcounts", "countcooldown"):
+            command = tree.get_command(name)
+            assert command is not None and command.guild_only, name
+            assert command.default_permissions == discord.Permissions(manage_guild=True), name
+            assert command.checks, name
+        period = tree.get_command("resetcounts").get_parameter("period")  # type: ignore[union-attr]
+        assert [c.value for c in period.choices] == ["daily", "weekly", "monthly", "alltime"]
+        seconds = tree.get_command("countcooldown").get_parameter("seconds")  # type: ignore[union-attr]
+        assert (seconds.min_value, seconds.max_value) == (0, 60)
+    finally:
+        await client.close()
