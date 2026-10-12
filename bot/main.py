@@ -32,7 +32,14 @@ from bot.commands.moderation import register_moderation_commands
 from bot.commands.stats import register_stats_command
 from bot.config import Config, ConfigError, load_config, prepare_storage
 from bot.counting.buffer import CountBuffer
-from bot.counting.filter import ChannelResolver, ExclusionCache, InstallCache, MessageCounter
+from bot.counting.filter import (
+    ChannelResolver,
+    CooldownTracker,
+    ExclusionCache,
+    InstallCache,
+    LbBanCache,
+    MessageCounter,
+)
 from bot.db.database import Database
 from bot.db.repo import Repo
 from bot.discord_ops import DiscordOps, DiscordPyOps
@@ -112,6 +119,8 @@ class Services:
     buffer: CountBuffer
     exclusions: ExclusionCache
     installs: InstallCache
+    lb_bans: LbBanCache
+    cooldowns: CooldownTracker
     counter: MessageCounter
     ranker: Ranker
     boards: BoardService
@@ -130,7 +139,9 @@ def build_services(config: Config, db: Database, ops: DiscordOps, clock: Clock) 
     buffer = CountBuffer(repo, flush_interval=config.flush_interval_seconds)
     exclusions = ExclusionCache(repo)
     installs = InstallCache(repo)
-    counter = MessageCounter(exclusions, ChannelResolver(ops), buffer, installs)
+    lb_bans = LbBanCache(repo)
+    cooldowns = CooldownTracker(repo)
+    counter = MessageCounter(exclusions, ChannelResolver(ops), buffer, installs, lb_bans, cooldowns)
     ranker = Ranker(repo)
     boards = BoardService(repo, ranker, ops, clock)
     machine = ResetMachine(repo, ops, buffer, ranker, clock, grace_seconds=config.reset_grace_seconds)
@@ -145,6 +156,8 @@ def build_services(config: Config, db: Database, ops: DiscordOps, clock: Clock) 
         buffer=buffer,
         exclusions=exclusions,
         installs=installs,
+        lb_bans=lb_bans,
+        cooldowns=cooldowns,
         counter=counter,
         ranker=ranker,
         boards=boards,
@@ -198,6 +211,8 @@ class LeaderboardBot(discord.Client):
         self.services = services
         await services.exclusions.load()
         await services.installs.load()
+        await services.lb_bans.load()
+        await services.cooldowns.load()
         register_persistent_items(self)
         register_admin_commands(self.tree, services)
         register_stats_command(self.tree, services)

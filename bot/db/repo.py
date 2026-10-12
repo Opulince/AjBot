@@ -531,13 +531,19 @@ class Repo:
     async def aggregate_counts(
         self, guild_id: int, start_day: str | None = None, end_day: str | None = None
     ) -> list[AggregateRow]:
-        """Per-user totals and milestone snowflake over ``[start_day, end_day)``, or all history."""
+        """Per-user totals and milestone snowflake over ``[start_day, end_day)``, or all history.
+
+        Users banned from the leaderboard are left out here, at query time, so
+        boards, ``/stats`` and reset winners all ignore them while their stored
+        counts stay intact (lifting the ban shows them again).
+        """
         base = (
             "SELECT dc.user_id AS user_id, SUM(dc.count) AS total, MAX(dc.last_message_id) AS milestone, "
             "       m.display_name AS display_name, m.username AS username, m.left_at AS left_at "
             "FROM daily_counts AS dc "
             "LEFT JOIN members AS m ON m.guild_id = dc.guild_id AND m.user_id = dc.user_id "
             "WHERE dc.guild_id = ? "
+            "AND NOT EXISTS (SELECT 1 FROM lb_banned_users AS b WHERE b.guild_id = dc.guild_id AND b.user_id = dc.user_id) "
         )
         params: list[Any] = [guild_id]
         if start_day is not None and end_day is not None:
