@@ -2,8 +2,8 @@
 
 A small, self-hosted Discord bot that keeps four automatically updating
 message-count leaderboards in one channel: **Daily**, **Weekly**, **Monthly** and
-**All-Time**. At each reset it announces the winner ("Member of the Day / Week /
-Month") and moves a configurable reward role to them.
+**All-Time**. At each reset the winner shows up in each board's "Previous Member of the Day /
+Week / Month" field (nothing separate is posted) and a configurable reward role moves to them.
 
 It is built for one community server, runs anywhere Python runs, and stores
 everything in a single SQLite file.
@@ -41,7 +41,8 @@ everything in a single SQLite file.
   three), the UTC day, week or month it is counting, the previous period's winner (not on All-Time),
   the next reset as a Discord relative and absolute timestamp (not on All-Time), an optional banner
   image and a "last updated" timestamp.
-- **Previous winner** fields are labelled *Previous Member of the Day / Week / Month* and always
+- **Previous winner** fields are labelled *Previous Member of the Day / Week / Month*. This is where
+  winners are shown: there is no separate winner post. They always
   describe the period immediately before the current one, with its key: its winner and recorded
   count, "No eligible winner" if nobody qualified, or "Tallying results…" while that period's reset
   is still being decided (grace period, retries, catch-up after downtime). An older period's winner
@@ -50,12 +51,12 @@ everything in a single SQLite file.
   Prev/Next). The ranking is recomputed on every click, and the buttons keep working after restarts.
 - **Automatic resets** at UTC boundaries (daily at 00:00, weekly on Monday 00:00 using ISO weeks,
   monthly on the 1st), each after a short grace period.
-- **Winner announcements**, with the board messages reposted below them so the boards stay at the bottom.
+- **No winner announcements.** Resets don't post anything; the boards are edited in place right after
+  a reset so the Previous field shows the new winner, and nobody is pinged.
 - **Reward roles**, one per period. The role is moved from the previous holder to the new winner, and
   the result is checked against the actual Discord roles.
 - **Missed-reset catch-up**: if the bot was offline across one or more boundaries, every missed period
-  is recorded with its correct historical winner, but only the latest of each type is announced and
-  given the role.
+  is recorded with its correct historical winner, but only the latest of each type is given the role.
 - **Crash safety**: resets and board reposts are persisted step by step and resume correctly after a
   crash or restart at any point.
 - **`/stats`** shows anyone's counts and ranks, using exactly the same ordering as the boards.
@@ -300,7 +301,7 @@ All administrative commands require **Manage Server**. They are hidden from memb
 | `/setrole period:<daily\|weekly\|monthly> role:<role>` | Sets that period's reward role. Rejects `@everyone` and integration-managed roles, and warns if the bot can't manage the role (hierarchy or permissions). |
 | `/setbanner set url:<https url>` | Sets the banner image. Only `https://` URLs on public hosts are accepted. The URL is never fetched by the bot. |
 | `/setbanner clear` | Removes the banner. |
-| `/forcereset period:<daily\|weekly\|monthly>` | **Testing helper.** Runs the real reset state machine on a synthetic period, from the start of the current period until now. Its key looks like `test-2026-03-10-20260310T180000123456`, so it can never collide with a scheduled reset, and the announcement is labelled `[TEST]`. It does post a real announcement and move the real reward role (the next scheduled reset reconciles the role normally). Use it on a test server. |
+| `/forcereset period:<daily\|weekly\|monthly>` | **Testing helper.** Runs the real reset state machine on a synthetic period, from the start of the current period until now. Its key looks like `test-2026-03-10-20260310T180000123456`, so it can never collide with a scheduled reset. Nothing is posted, and test runs never appear in the boards' Previous field (that only shows real periods). It does move the real reward role (the next scheduled reset reconciles the role normally). Use it on a test server. |
 | `/stats [user]` | Anyone can use it. Shows Daily, Weekly, Monthly and All-Time counts and ranks for you or the given user, ephemerally. |
 
 `/setbanner` is a command group (`set` and `clear`) because Discord does not allow one command to
@@ -346,9 +347,10 @@ with the exact period boundaries stored. It moves through
 `ROLES_SUPERSEDED`. Every transition is persisted.
 - **PENDING:** before computing a winner, the bot forces a buffer flush. If the flush fails, the run waits.
 - **COMPUTED:** once a winner is computed it is frozen.
-- **ANNOUNCED:** the bot records that it is about to post before posting. After a crash it scans the
-  channel for the announcement's hidden marker `reset:{guild}:{type}:{key}` and adopts the message
-  instead of posting a duplicate.
+- **ANNOUNCED:** the announcement step always resolves silently (the state name is kept for database
+  compatibility). Upgrade safety: if an older version crashed mid-announce, the channel is scanned once
+  for that announcement's hidden marker `reset:{guild}:{type}:{key}` and the message is adopted; if
+  the scan fails, the step still resolves silently instead of blocking.
 - **ROLES_DONE:** role changes are idempotent (add if missing, remove if present). They are verified
   against the members' real Discord roles before `role_holders` is updated.
 - **Failures:** Forbidden, hierarchy, rate-limit and network errors increment `attempts`, record
@@ -356,12 +358,11 @@ with the exact period boundaries stored. It moves through
 
 **Catch-up rules.**
 - Missed periods are processed oldest first.
-- Only the most recent ended period of each type is announced.
 - The role goes to the latest *eligible* winner: an empty latest period leaves the role with the
   previous winner.
 - Older runs that never started role work become `ROLES_SUPERSEDED`. A run whose role work was
   interrupted is always finished first, never skipped.
-- One board repost happens after all catch-up announcements.
+- The boards are edited in place once the latest results are in; resets never repost them.
 
 **Duplicate-safe sends.** Every message is created with a random nonce that Discord enforces. If
 discord.py internally retries a request after a lost response (5xx or connection reset), Discord
@@ -403,14 +404,15 @@ restarts.
 - **Changing a reward role with `/setrole`** does not strip the old role from its previous holder,
   because it might be a role used for other things. Remove it manually if needed.
 - **A recreated board lands at the bottom.** When a single board message is deleted by hand, only that
-  board is reposted, below the others. The next reset announcement restores the normal order.
-- **Recovery scans are bounded.** They read up to 1,000 messages after a repost or announcement attempt
-  started. Untracked duplicate boards are also swept from the newest 200 messages when a repost finishes.
+  board is reposted, below the others, and it stays there (resets no longer repost the boards). Moving
+  the leaderboard with `/setup` reposts all four in order.
+- **Recovery scans are bounded.** They read up to 1,000 messages after a repost (or a legacy
+  announcement attempt) started. Untracked duplicate boards are also swept from the newest 200 messages when a repost finishes.
   In an extremely busy channel a crash could still leave one duplicate message. Use a dedicated,
   read-only leaderboard channel.
 - **Ephemeral "Show 11–100" pages** only work while Discord still shows the ephemeral message. Clicks on
   expired pages are ignored gracefully.
-- **`/forcereset` is not a dry run.** It posts a `[TEST]` announcement and moves the real reward role.
+- **`/forcereset` is not a dry run.** It posts nothing, but it moves the real reward role.
   Use a private test server for experiments. A test run that cannot be computed within a few minutes
   (for example because Discord is unreachable) is closed without a winner, because the day's counts
   would by then include messages sent after the test period.
@@ -432,7 +434,7 @@ Discord operation. Restarts are simulated with fresh application instances over 
 Highlights:
 - **`test_resets.py`** crashes the reset flow at every Discord mutation (before and after it takes
   effect, once and twice) and checks that recovery converges to:
-  - exactly one announcement per period
+  - no announcement posts (an older version's interrupted post is adopted, never duplicated)
   - the frozen winner
   - the right role holder
   - four correctly ordered boards
@@ -468,13 +470,16 @@ the bot mid-reset). Don't run failure experiments in the production community.
 10. **Role hierarchy failure:** move a reward role above the bot's role, then run `/forcereset` for that
     period. The reset reports it didn't finish, the logs show a `forbidden` error, the bot keeps running
     and the boards keep updating. Fix the hierarchy and the retry succeeds.
-11. **Forced reset:** run `/forcereset period:daily`. Check the `[TEST]` announcement, that the role moved
-    to the current leader, that the boards were reposted below the announcement, and the command's
-    success message.
-12. **Crash during a reset:** start `/forcereset` (or wait for a real boundary), stop the bot abruptly
-    mid-way (`docker kill` / `kill -9`), restart it, and confirm it finishes: one announcement, the
-    correct role holder, four boards.
-13. **Logs:** read `LOG_DIR/leaderboard.log`. Failures name the guild, the run and the error class, and
+11. **Forced reset:** run `/forcereset period:daily`. Check that nothing was posted in the channel, that
+    the role moved to the current leader, and the command's success message. The Previous field does
+    *not* change (test runs are never shown there).
+12. **Real reset:** after a real UTC midnight (plus the grace period), check that nothing was posted,
+    the four boards are the same messages, the daily board's Previous field shows the winner, and the
+    role moved.
+13. **Crash during a reset:** wait for a real boundary (or start `/forcereset`), stop the bot abruptly
+    mid-way (`docker kill` / `kill -9`), restart it, and confirm it finishes: no post, the correct role
+    holder, four boards.
+14. **Logs:** read `LOG_DIR/leaderboard.log`. Failures name the guild, the run and the error class, and
     the token never appears.
-14. **Graceful shutdown:** send messages, stop the bot gracefully within a few seconds (`docker stop` /
+15. **Graceful shutdown:** send messages, stop the bot gracefully within a few seconds (`docker stop` /
     `systemctl stop` / Ctrl+C), restart, and confirm no counts were lost.

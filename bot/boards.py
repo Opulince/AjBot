@@ -4,8 +4,9 @@ Normal updates edit the four existing board messages in place. Only a confirmed
 ``NotFound`` causes that one board to be reposted; Forbidden, rate limits and
 transient failures just skip the round.
 
-Full reposts (needed so a reset announcement sits above all four boards) use a
-persisted generation protocol stored in ``board_repost``:
+Full reposts (first setup, a moved leaderboard channel, or a ``repost_needed``
+flag left by an older version that announced resets) use a persisted generation
+protocol stored in ``board_repost``:
 
 1. ``POSTING`` is persisted with a new generation and the old message IDs.
 2. Recent channel history is scanned for bot messages carrying this
@@ -315,15 +316,17 @@ class BoardService:
         return op
 
     async def reconcile(self, guild_id: int) -> bool:
-        """Finish any in-progress repost, then start one if an announcement requested it.
+        """Finish any in-progress repost, then start one if a legacy ``repost_needed`` flag asks for it.
 
+        Resets no longer set the flag (they don't post announcements), but a
+        database written by an older version may still have it set.
         Returns ``True`` when no repost work remains.
         """
         if not await self.process_repost(guild_id):
             return False
         cfg = await self._repo.get_guild_config(guild_id)
         if cfg is not None and cfg.repost_needed:
-            await self.request_repost(guild_id, "reset announcement")
+            await self.request_repost(guild_id, "legacy reset announcement")
             return await self.process_repost(guild_id)
         return True
 

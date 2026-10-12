@@ -145,12 +145,16 @@ def describe_forced_run(run: ResetRun) -> str:
     if run.status is RunStatus.SKIPPED_EMPTY:
         if run.last_error:  # e.g. a stale forced test run
             note = run.last_error[0].upper() + run.last_error[1:]
-            return head + f"\n{note}. No announcement or role change was made."
-        return head + "\nNobody eligible had messages in this period, so no announcement or role change was made."
+            return head + f"\n{note}. No role change was made."
+        return head + "\nNobody eligible had messages in this period, so no role change was made."
     if run.status is RunStatus.DONE:
         winner = f"<@{run.winner_user_id}> with {run.winner_count} messages"
         role = f"\nRole step note: {run.last_error}" if run.last_error else ""
-        return head + f"\nWinner: {winner}. Announcement and role step completed.{role}"
+        return (
+            head
+            + f"\nWinner: {winner}. Role step completed. Nothing is posted publicly, and test runs never "
+            + f"appear in the boards' \"Previous …\" field.{role}"
+        )
     if run.status is RunStatus.ROLES_SUPERSEDED:
         return head + "\nA newer run owns the reward role, so this test run did not change it."
     detail = f"\nLast error: {run.last_error}" if run.last_error else ""

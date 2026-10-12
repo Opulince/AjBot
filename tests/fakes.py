@@ -184,7 +184,18 @@ class FakeDiscord(DiscordOps):
         return [m for m in self.channels.get(channel_id, []) if m.board is not None]
 
     def announcements(self, channel_id: int) -> list[FakeMessage]:
+        """Reset announcements (only older versions posted them; see ``legacy`` tests)."""
         return [m for m in self.channels.get(channel_id, []) if "reset:" in m.footer]
+
+    def bot_posts(self, channel_id: int) -> list[FakeMessage]:
+        """Bot messages in a channel other than the boards themselves."""
+        return [m for m in self.channels.get(channel_id, []) if m.author_id == self._bot_id and m.board is None]
+
+    def previous_field(self, channel_id: int, board_type: str) -> str:
+        """The "Previous Member of …" field of a board as currently shown."""
+        board = next(m for m in self.board_messages(channel_id) if m.board and m.board[1] == board_type)
+        fields = (board.embed or {}).get("fields") or []
+        return next(f["value"] for f in fields if f["name"].startswith("Previous"))
 
     def count(self, op: str) -> int:
         return sum(1 for c in self.calls if c[0] == op)

@@ -1,4 +1,4 @@
-"""Embeds for leaderboards, pagination pages, announcements and stats."""
+"""Embeds for leaderboards, pagination pages and stats."""
 
 from __future__ import annotations
 
@@ -20,11 +20,6 @@ BOARD_TITLES = {
     "weekly": "Weekly Leaderboard",
     "monthly": "Monthly Leaderboard",
     "alltime": "All-Time Leaderboard",
-}
-WINNER_TITLES = {
-    "daily": "Member of the Day",
-    "weekly": "Member of the Week",
-    "monthly": "Member of the Month",
 }
 PREVIOUS_LABELS = {
     "daily": "Previous Member of the Day",
@@ -53,6 +48,7 @@ def board_marker(guild_id: int, board_type: str, generation: int) -> str:
 
 
 def reset_marker(guild_id: int, period_type: str, period_key: str) -> str:
+    """Marker that older versions put in reset announcements (still read to adopt one after a crash)."""
     return f"reset:{guild_id}:{period_type}:{period_key}"
 
 
@@ -232,37 +228,6 @@ def period_label(period_type: str, period_key: str, is_test: bool) -> str:
     if period_type == "weekly":
         return f"ISO week {period_key}"
     return period_key
-
-
-def build_announcement(
-    *,
-    guild_id: int,
-    period_type: str,
-    period_key: str,
-    winner_id: int,
-    winner_name: str | None,
-    count: int,
-    is_test: bool,
-) -> tuple[str, discord.Embed]:
-    title = WINNER_TITLES[period_type]
-    prefix = "[TEST] " if is_test else ""
-    content = f"{prefix}**{title}:** <@{winner_id}> — {plural(count)}"
-    embed = discord.Embed(
-        title=f"{prefix}{title}",
-        color=COLORS[period_type],
-        description=(
-            f"<@{winner_id}> · {safe_name(winner_name)} sent **{plural(count)}** during "
-            f"{period_label(period_type, period_key, is_test)}."
-        ),
-    )
-    if is_test:
-        embed.add_field(
-            name="Forced test reset",
-            value="Triggered with /forcereset. This is a test of the reset flow, not an official result.",
-            inline=False,
-        )
-    embed.set_footer(text=reset_marker(guild_id, period_type, period_key))
-    return content, embed
 
 
 STATS_LABELS = {"daily": "Daily", "weekly": "Weekly", "monthly": "Monthly", "alltime": "All-Time"}

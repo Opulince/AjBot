@@ -827,25 +827,17 @@ class Repo:
         assert row is not None
         return _run(row)
 
-    async def mark_announced(
-        self, run: ResetRun, now: datetime, *, channel_id: int | None, message_id: int | None, repost_needed: bool
-    ) -> ResetRun:
-        """COMPUTED -> ANNOUNCED, flagging a board repost in the same transaction."""
+    async def mark_announced(self, run: ResetRun, now: datetime, *, message_id: int | None = None) -> ResetRun:
+        """COMPUTED -> ANNOUNCED. ``message_id`` is only set when a legacy announcement was adopted."""
         stamp = to_iso(now)
         async with self.db.transaction() as conn:
             cur = await conn.execute(
-                "UPDATE reset_runs SET status = 'ANNOUNCED', announcement_channel_id = COALESCE(?, announcement_channel_id), "
-                "  announcement_message_id = ?, attempts = 0, last_error = NULL, next_attempt_at = NULL, "
-                "  updated_at = ? WHERE id = ? AND status = 'COMPUTED'",
-                (channel_id, message_id, stamp, run.id),
+                "UPDATE reset_runs SET status = 'ANNOUNCED', announcement_message_id = ?, attempts = 0, "
+                "  last_error = NULL, next_attempt_at = NULL, updated_at = ? WHERE id = ? AND status = 'COMPUTED'",
+                (message_id, stamp, run.id),
             )
             if cur.rowcount != 1:
                 raise StaleRunError(f"{run.describe()} is no longer COMPUTED")
-            if repost_needed:
-                await conn.execute(
-                    "UPDATE guild_config SET repost_needed = 1, updated_at = ? WHERE guild_id = ?",
-                    (stamp, run.guild_id),
-                )
             row = await _fetchone(conn, "SELECT * FROM reset_runs WHERE id = ?", (run.id,))
         assert row is not None
         return _run(row)
