@@ -276,6 +276,10 @@ class DiscordOps(ABC):
     async def dm_user(self, user_id: int, *, content: str | None = None, embed: discord.Embed | None = None) -> bool:
         """Send a direct message. ``False`` if the user doesn't accept DMs from the bot (closed DMs)."""
 
+    @abstractmethod
+    def guild_name(self, guild_id: int) -> str | None:
+        """The server's name from the cache, or ``None`` if it isn't cached."""
+
 
 # --------------------------------------------------------------------- helpers
 
@@ -592,6 +596,10 @@ class DiscordPyOps(DiscordOps):
         except OpForbidden:
             return False  # 50007: the user has DMs from server members closed (or blocked the bot)
         return True
+
+    def guild_name(self, guild_id: int) -> str | None:
+        guild = self._client.get_guild(guild_id)
+        return guild.name if guild is not None else None
 
 
 def role_rank(role: discord.Role) -> RoleRank:

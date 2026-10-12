@@ -81,9 +81,9 @@ async def test_command_structure_and_permissions(app: App) -> None:
     client, tree = await _tree(app.services)
     try:
         commands = {c.name: c for c in tree.get_commands()}
-        assert set(commands) == {"setup", "exclude", "setrole", "setbanner", "forcereset", "stats"}
+        assert set(commands) == {"setup", "exclude", "setrole", "setbanner", "forcereset", "winnerdm", "stats"}
         manage = discord.Permissions(manage_guild=True)
-        for name in ("setup", "exclude", "setrole", "setbanner", "forcereset"):
+        for name in ("setup", "exclude", "setrole", "setbanner", "forcereset", "winnerdm"):
             assert commands[name].default_permissions == manage, name
             assert commands[name].guild_only, name
         assert commands["stats"].default_permissions is None and commands["stats"].guild_only
@@ -93,7 +93,8 @@ async def test_command_structure_and_permissions(app: App) -> None:
         banner = commands["setbanner"]
         assert isinstance(banner, app_commands.Group) and {c.name for c in banner.commands} == {"set", "clear"}
         # Every admin leaf command also checks Manage Server at runtime.
-        leaves = [commands["setup"], commands["setrole"], commands["forcereset"], *exclude.commands, *banner.commands]
+        leaves = [commands["setup"], commands["setrole"], commands["forcereset"], commands["winnerdm"],
+                  *exclude.commands, *banner.commands]
         assert all(leaf.checks for leaf in leaves)
         # /exclude accepts categories, forums and text channels.
         target = exclude.get_command("add").get_parameter("target")  # type: ignore[union-attr]
