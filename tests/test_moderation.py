@@ -1048,3 +1048,197 @@ async def test_form_errors_are_reported_not_swallowed(staff: App, caplog: pytest
     await form.on_error(interaction, RuntimeError("boom"))
     assert "Something went wrong" in interaction.response.sent[0]
     assert any("Moderation form WarnModal failed" in r.getMessage() for r in caplog.records)
+
+
+# ============================================================ tempban (F)
+
+
+async def _tempban(app: App, target: int = TARGET, duration: timedelta = timedelta(hours=1)) -> str:
+    return await mod.ban(app.services, GUILD, ACTOR, target, "cool off", duration=duration)
+
+
+async def test_tempban_records_and_schedules(staff: App, fake: FakeDiscord, clock: Any) -> None:
+    message = await _tempban(staff)
+    assert "Banned <@11> for 1h" in message and "Case #1." in message
+    case = await staff.repo.get_case(GUILD, 1)
+    assert case is not None and case.duration_seconds == 3600
+    schedule = await staff.repo.get_scheduled_unban(GUILD, TARGET)
+    assert schedule is not None and schedule.unban_at == clock.now() + timedelta(hours=1) and schedule.case_id == 1
+    fields = {f["name"]: f["value"] for f in fake.messages(MODLOG)[0].embed["fields"]}
+    end = int((clock.now() + timedelta(hours=1)).timestamp())
+    assert fields["Duration"] == f"1h · ends <t:{end}:f> (<t:{end}:R>)"
+    with pytest.raises(ModError, match="365 days"):
+        await mod.ban(staff.services, GUILD, ACTOR, 12, None, duration=timedelta(days=366))
+
+
+async def test_tempban_expires_after_a_restart(staff: App, fake: FakeDiscord, clock: Any, config: Any) -> None:
+    await _tempban(staff, duration=timedelta(hours=2))
+    await staff.crash()  # hard stop: nothing in memory survives
+    clock.advance(hours=1, minutes=59)
+    app = await App.start(config, fake, clock)
+    assert await app.services.unbans.tick() == 0 and TARGET in fake.guilds[GUILD].bans  # not yet due
+    clock.advance(minutes=1)
+    assert await app.services.unbans.tick() == 1
+    assert TARGET not in fake.guilds[GUILD].bans
+    assert await app.repo.get_scheduled_unban(GUILD, TARGET) is None
+    unban = await app.repo.get_case(GUILD, 2)
+    assert unban is not None and unban.action == "unban" and unban.moderator_id == fake.bot_user_id
+    assert unban.reason == "Tempban expired" and unban.extra == {"ban_case": 1}
+    call = next(c for c in fake.calls if c[0] == "unban_user")
+    assert call[3] == "Tempban expired (case #1)"  # Audit Log reason
+    assert fake.messages(MODLOG)[-1].embed["title"] == "Unban · Case #2"
+    assert await app.services.unbans.tick() == 0  # done exactly once
+
+
+async def test_expired_tempban_lifted_by_hand_counts_as_done(staff: App, fake: FakeDiscord, clock: Any) -> None:
+    await _tempban(staff)
+    del fake.guilds[GUILD].bans[TARGET]  # someone unbanned them in Discord's UI
+    clock.advance(hours=2)
+    assert await staff.services.unbans.tick() == 1
+    assert await staff.repo.get_scheduled_unban(GUILD, TARGET) is None
+    unban = await staff.repo.get_case(GUILD, 2)
+    assert unban is not None and "already been lifted" in (unban.reason or "")
+
+
+async def test_failed_unban_backs_off_and_retries(staff: App, fake: FakeDiscord, clock: Any) -> None:
+    await _tempban(staff)
+    clock.advance(hours=1)
+    fake.fail_next("unban_user", OpForbidden("Missing Permissions", code=50013))
+    assert await staff.services.unbans.tick() == 0
+    failed = await staff.repo.get_scheduled_unban(GUILD, TARGET)
+    assert failed is not None and failed.attempts == 1 and "forbidden" in (failed.last_error or "")
+    assert failed.next_attempt_at is not None and failed.next_attempt_at > clock.now()
+    assert await staff.services.unbans.tick() == 0 and fake.count("unban_user") == 1  # backing off
+    clock.set(failed.next_attempt_at)
+    assert await staff.services.unbans.tick() == 1 and TARGET not in fake.guilds[GUILD].bans
+
+
+async def test_crash_between_unban_and_commit_finishes_once(staff: App, fake: FakeDiscord, clock: Any, config: Any) -> None:
+    from tests.fakes import SimulatedCrash
+
+    await _tempban(staff)
+    clock.advance(hours=1)
+    fake.crash_after("unban_user", 1)
+    with pytest.raises(SimulatedCrash):
+        await staff.services.unbans.tick()
+    await staff.crash()
+    fake.clear_injections()
+    assert TARGET not in fake.guilds[GUILD].bans  # Discord lifted it; the database never heard
+    app = await App.start(config, fake, clock)
+    assert await app.services.unbans.tick() == 1
+    assert await app.repo.get_scheduled_unban(GUILD, TARGET) is None
+    assert [c[1] for c in await cases(app)] == ["ban", "unban"]  # exactly one unban case
+
+
+async def test_permanent_ban_cancels_an_earlier_tempban(staff: App, fake: FakeDiscord, clock: Any) -> None:
+    await _tempban(staff)
+    message = await mod.ban(staff.services, GUILD, ACTOR, TARGET, "for good")
+    assert "permanently" in message and "automatic unban was cancelled" in message
+    clock.advance(days=2)
+    assert await staff.services.unbans.tick() == 0 and TARGET in fake.guilds[GUILD].bans
+
+
+async def test_new_tempban_replaces_the_schedule(staff: App, fake: FakeDiscord, clock: Any) -> None:
+    await _tempban(staff, duration=timedelta(hours=1))
+    await _tempban(staff, duration=timedelta(days=1))
+    clock.advance(hours=2)
+    assert await staff.services.unbans.tick() == 0 and TARGET in fake.guilds[GUILD].bans
+    clock.advance(days=1)
+    assert await staff.services.unbans.tick() == 1 and TARGET not in fake.guilds[GUILD].bans
+    assert (await staff.repo.get_case(GUILD, 3)).extra == {"ban_case": 2}  # type: ignore[union-attr]
+
+
+async def test_manual_unban_removes_the_schedule(staff: App, fake: FakeDiscord, clock: Any) -> None:
+    await _tempban(staff)
+    assert "Unbanned" in await mod.unban(staff.services, GUILD, ACTOR, TARGET, "appeal")
+    assert await staff.repo.get_scheduled_unban(GUILD, TARGET) is None
+    await mod.ban(staff.services, GUILD, ACTOR, TARGET, "back to it")  # banned again, permanently
+    clock.advance(hours=2)
+    assert await staff.services.unbans.tick() == 0 and TARGET in fake.guilds[GUILD].bans
+
+
+async def test_stale_snapshot_never_lifts_a_newer_ban(staff: App, fake: FakeDiscord, clock: Any) -> None:
+    await _tempban(staff)
+    clock.advance(hours=1)
+    [stale] = await staff.repo.due_unbans(clock.now())
+    await mod.ban(staff.services, GUILD, ACTOR, TARGET, "re-banned meanwhile")  # permanent
+    assert await staff.services.unbans.process(stale) is False
+    assert TARGET in fake.guilds[GUILD].bans and fake.count("unban_user") == 0
+
+
+async def test_scheduled_unban_waits_for_a_ban_in_progress(staff: App, fake: FakeDiscord, clock: Any) -> None:
+    await _tempban(staff)
+    clock.advance(hours=1)
+    lock = staff.services.mod_locks.get(GUILD)
+    async with lock:  # a /ban for this guild is mid-flight
+        task = asyncio.create_task(staff.services.unbans.tick())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not task.done() and fake.count("unban_user") == 0
+        # The moderator's ban (issued while the lock is held) makes it permanent.
+        await staff.repo.delete_scheduled_unban(GUILD, TARGET)
+    assert await task == 0 and TARGET in fake.guilds[GUILD].bans
+
+
+async def test_tempban_survives_a_failed_case_write_and_reports_a_failed_schedule(
+    staff: App, fake: FakeDiscord, clock: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def broken(*_a: Any, **_k: Any) -> Any:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(staff.repo, "create_case", broken)
+    await _tempban(staff)
+    schedule = await staff.repo.get_scheduled_unban(GUILD, TARGET)
+    assert schedule is not None and schedule.case_id is None  # the unban still happens
+    monkeypatch.undo()
+    monkeypatch.setattr(staff.repo, "schedule_unban", broken)
+    message = await _tempban(staff, target=12)
+    assert "automatic unban couldn't be scheduled" in message and 12 in fake.guilds[GUILD].bans
+
+
+async def test_ban_command_parses_the_duration(staff: App, fake: FakeDiscord) -> None:
+    client, tree = await _mod_tree(staff.services)
+    try:
+        ban_cmd = tree.get_command("ban")
+        bad = _interaction()
+        await ban_cmd.callback(bad, SimpleNamespace(id=TARGET), None, 0, "forever-ish")  # type: ignore[union-attr]
+        assert "Use a duration like" in bad.response.sent[0] and TARGET not in fake.guilds[GUILD].bans
+        good = _interaction()
+        await ban_cmd.callback(good, SimpleNamespace(id=TARGET), "spam", 0, "7d")  # type: ignore[union-attr]
+        assert "Banned <@11> for 7d" in good.followups[0]
+        assert await staff.repo.get_scheduled_unban(GUILD, TARGET) is not None
+        assert not ban_cmd.get_parameter("duration").required  # type: ignore[union-attr]
+    finally:
+        await client.close()
+
+
+async def test_scheduler_loop_runs_resets_and_unbans(tmp_path: Any, fake: FakeDiscord, clock: Any,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    from bot.main import LeaderboardBot, build_services
+    from tests.fakes import make_config
+
+    config = make_config(tmp_path)
+    bot = LeaderboardBot(config, clock=clock)
+    await bot.db.connect()
+    bot.services = build_services(config, bot.db, fake, clock)
+    order: list[str] = []
+
+    async def ready() -> None:
+        return None
+
+    async def reset_tick() -> None:
+        order.append("resets")
+
+    async def unban_tick() -> int:
+        order.append("unbans")
+        bot._stop.set()
+        return 0
+
+    monkeypatch.setattr(bot, "wait_until_ready", ready)
+    monkeypatch.setattr(bot.services.runner, "tick", reset_tick)
+    monkeypatch.setattr(bot.services.unbans, "tick", unban_tick)
+    try:
+        await asyncio.wait_for(bot._scheduler_loop(), timeout=5)
+        assert order == ["resets", "unbans"]
+    finally:
+        await bot.close()
