@@ -15,6 +15,9 @@ from typing import Mapping
 DEFAULT_DB_PATH = "data/leaderboard.db"
 DEFAULT_LOG_DIR = "logs"
 VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+# Roles allowed to use the bot's commands (everything except /stats). Override with
+# STAFF_ROLE_IDS (comma-separated role IDs), or STAFF_ROLE_IDS=off to drop the gate.
+DEFAULT_STAFF_ROLE_IDS = (1343413837101011047, 1343265536141688964, 1534411578378682519)
 
 # Values that clearly come from an un-edited .env.example.
 _PLACEHOLDER_TOKENS = {
@@ -39,6 +42,7 @@ class Config:
     board_update_seconds: int
     log_dir: Path
     log_level: str = "INFO"
+    staff_role_ids: tuple[int, ...] = ()  # empty: no staff-role gate
 
 
 def prepare_storage(config: Config) -> None:
@@ -133,6 +137,8 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     if log_level not in VALID_LOG_LEVELS:
         errors.append(f"LOG_LEVEL must be one of {', '.join(VALID_LOG_LEVELS)}, got {log_level!r}")
 
+    staff_role_ids = _parse_role_ids(env.get("STAFF_ROLE_IDS", ""), errors)
+
     if errors:
         raise ConfigError("Invalid configuration:\n  - " + "\n  - ".join(errors))
 
@@ -144,4 +150,22 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         board_update_seconds=int(board),
         log_dir=log_dir,
         log_level=log_level,
+        staff_role_ids=staff_role_ids,
     )
+
+
+def _parse_role_ids(raw: str, errors: list[str]) -> tuple[int, ...]:
+    text = raw.strip()
+    if not text:
+        return DEFAULT_STAFF_ROLE_IDS
+    if text.lower() == "off":
+        return ()
+    ids: list[int] = []
+    for part in text.replace(" ", "").split(","):
+        if not part:
+            continue
+        if not part.isdigit() or not 15 <= len(part) <= 21:
+            errors.append(f"STAFF_ROLE_IDS must be comma-separated role IDs (or 'off'), got {part!r}")
+            return DEFAULT_STAFF_ROLE_IDS
+        ids.append(int(part))
+    return tuple(dict.fromkeys(ids))
