@@ -17,7 +17,7 @@ import asyncio
 import logging
 import signal
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from typing import Any
 
@@ -40,6 +40,7 @@ from bot.ranking import Ranker
 from bot.resets.machine import ResetMachine
 from bot.resets.runner import TICK_SECONDS, GuildLocks, ResetRunner
 from bot.ui.views import register_persistent_items
+from bot.unbans import UnbanRunner
 
 log = logging.getLogger("bot")
 
@@ -117,6 +118,10 @@ class Services:
     machine: ResetMachine
     runner: ResetRunner
     locks: GuildLocks
+    # Serialises bans/unbans with scheduled unbans per guild (separate from the
+    # board/reset locks so moderation never waits for board edits).
+    mod_locks: GuildLocks
+    unbans: UnbanRunner = field(init=False)
 
 
 def build_services(config: Config, db: Database, ops: DiscordOps, clock: Clock) -> Services:
@@ -131,7 +136,7 @@ def build_services(config: Config, db: Database, ops: DiscordOps, clock: Clock) 
     machine = ResetMachine(repo, ops, buffer, ranker, clock, grace_seconds=config.reset_grace_seconds)
     locks = GuildLocks()
     runner = ResetRunner(repo, machine, boards, clock, locks)
-    return Services(
+    services = Services(
         config=config,
         clock=clock,
         db=db,
@@ -146,7 +151,10 @@ def build_services(config: Config, db: Database, ops: DiscordOps, clock: Clock) 
         machine=machine,
         runner=runner,
         locks=locks,
+        mod_locks=GuildLocks(),
     )
+    services.unbans = UnbanRunner(services)
+    return services
 
 
 def make_intents() -> discord.Intents:
@@ -241,9 +249,16 @@ class LeaderboardBot(discord.Client):
 
     async def _scheduler_loop(self) -> None:
         await self.wait_until_ready()
-        assert self.services is not None
-        log.info("Reset scheduler started (startup catch-up runs now)")
-        await self.services.runner.run(self._stop, interval=TICK_SECONDS)
+        services = self.services
+        assert services is not None
+        log.info("Scheduler started (reset catch-up and expired tempbans run now)")
+        while not self._stop.is_set():
+            await services.runner.tick()
+            await services.unbans.tick()
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=TICK_SECONDS)
+            except asyncio.TimeoutError:
+                pass
 
     async def _board_loop(self) -> None:
         await self.wait_until_ready()

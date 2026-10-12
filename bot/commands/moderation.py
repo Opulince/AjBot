@@ -242,6 +242,7 @@ def register_moderation_commands(tree: app_commands.CommandTree, services: "Serv
         user="User to ban",
         reason="Shown in the mod log and the Audit Log",
         delete_message_days="Also delete their messages from the last 0-7 days (default 0)",
+        duration="Temporary ban: 1h, 7d, 30d … up to 365d (leave empty for a permanent ban)",
     )
     @app_commands.guild_only()
     @app_commands.default_permissions(ban_members=True)
@@ -252,13 +253,19 @@ def register_moderation_commands(tree: app_commands.CommandTree, services: "Serv
         user: discord.User,
         reason: Optional[Reason] = None,
         delete_message_days: app_commands.Range[int, 0, 7] = 0,
+        duration: Optional[app_commands.Range[str, 1, 32]] = None,
     ) -> None:
         assert interaction.guild_id is not None
+        try:
+            length = mod.parse_duration(duration) if duration else None
+        except mod.ModError as exc:
+            await _reply(interaction, str(exc))
+            return
         await run_action(
             interaction,
             lambda: mod.ban(
                 services, interaction.guild_id, actor_of(interaction), user.id, reason,
-                delete_message_days=delete_message_days,
+                delete_message_days=delete_message_days, duration=length,
             ),
         )
 
