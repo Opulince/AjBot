@@ -487,27 +487,80 @@ async def ban(
     reason: str | None,
     *,
     delete_message_days: int = 0,
+    duration: timedelta | None = None,
 ) -> str:
+    """Ban a user, permanently or (with ``duration``) until a scheduled unban.
+
+    A permanent ban cancels any pending scheduled unban from an earlier tempban,
+    and a new tempban replaces it, so a stale schedule never lifts a newer ban.
+    """
     if not 0 <= delete_message_days <= 7:
         raise ModError("Messages can be deleted for 0 to 7 days.")
+    if duration is not None and not timedelta(0) < duration <= MAX_TEMPBAN:
+        raise ModError("A temporary ban can last at most 365 days. Leave the duration empty for a permanent ban.")
     await check_target(services, guild_id, actor, target_id, verb="ban", require_member=False)
-    await run_discord_action(
-        lambda: services.ops.ban_user(
-            guild_id, target_id, delete_message_seconds=delete_message_days * 86400, reason=actor.audit(reason)
-        ),
-        verb="ban", target_id=target_id,
-    )
     extra = {"delete_message_days": delete_message_days} if delete_message_days else None
-    case = await record_case(services, guild_id, "ban", target_id=target_id, actor=actor, reason=reason, extra=extra)
-    return f"Banned <@{target_id}> permanently.{case_note(case)}"
+    seconds = int(duration.total_seconds()) if duration is not None else None
+    async with services.mod_locks.get(guild_id):  # shared with the unban scheduler
+        await run_discord_action(
+            lambda: services.ops.ban_user(
+                guild_id, target_id, delete_message_seconds=delete_message_days * 86400, reason=actor.audit(reason)
+            ),
+            verb="ban", target_id=target_id,
+        )
+        case = await record_case(
+            services, guild_id, "ban", target_id=target_id, actor=actor, reason=reason,
+            duration_seconds=seconds, extra=extra,
+        )
+        if duration is None:
+            schedule = await _cancel_scheduled_unban(services, guild_id, target_id)
+            return f"Banned <@{target_id}> permanently.{case_note(case)}{schedule}"
+        until = services.clock.now() + duration
+        schedule = await _schedule_unban(services, guild_id, target_id, until, case)
+    return (
+        f"Banned <@{target_id}> for {format_duration(seconds or 0)} "
+        f"(until {_ts(until)}, {_ts(until, 'R')}).{case_note(case)}{schedule}"
+    )
+
+
+async def _schedule_unban(
+    services: "Services", guild_id: int, user_id: int, until: datetime, case: ModCase | None
+) -> str:
+    try:
+        await services.repo.schedule_unban(guild_id, user_id, until, case.case_id if case else None)
+    except Exception:
+        log.exception("Tempban of %s in guild %s: the automatic unban could not be scheduled", user_id, guild_id)
+        return (
+            f"\n**The automatic unban couldn't be scheduled** (error logged), so this ban won't end by itself. "
+            f"Unban them manually after {_ts(until)}."
+        )
+    return ""
+
+
+async def _cancel_scheduled_unban(services: "Services", guild_id: int, user_id: int) -> str:
+    try:
+        cancelled = await services.repo.delete_scheduled_unban(guild_id, user_id)
+    except Exception:
+        log.exception("Could not cancel the scheduled unban of %s in guild %s", user_id, guild_id)
+        return (
+            "\n**Warning:** an earlier tempban's automatic unban couldn't be cancelled (error logged) and may still "
+            "lift this ban. Check again later."
+        )
+    return " Their earlier tempban's automatic unban was cancelled." if cancelled else ""
 
 
 async def unban(services: "Services", guild_id: int, actor: Actor, user_id: int, reason: str | None) -> str:
-    await run_discord_action(
-        lambda: services.ops.unban_user(guild_id, user_id, reason=actor.audit(reason)),
-        verb="unban", target_id=user_id, not_found=f"<@{user_id}> (`{user_id}`) isn't banned.",
-    )
-    case = await record_case(services, guild_id, "unban", target_id=user_id, actor=actor, reason=reason)
+    async with services.mod_locks.get(guild_id):  # shared with the unban scheduler
+        await run_discord_action(
+            lambda: services.ops.unban_user(guild_id, user_id, reason=actor.audit(reason)),
+            verb="unban", target_id=user_id, not_found=f"<@{user_id}> (`{user_id}`) isn't banned.",
+        )
+        try:
+            await services.repo.delete_scheduled_unban(guild_id, user_id)
+        except Exception:
+            # Harmless if it stays: when it comes due, "Unknown Ban" just closes it.
+            log.exception("Could not delete the scheduled unban of %s in guild %s", user_id, guild_id)
+        case = await record_case(services, guild_id, "unban", target_id=user_id, actor=actor, reason=reason)
     return f"Unbanned <@{user_id}> (`{user_id}`).{case_note(case)}"
 
 
