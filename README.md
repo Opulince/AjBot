@@ -5,6 +5,10 @@ message-count leaderboards in one channel: **Daily**, **Weekly**, **Monthly** an
 **All-Time**. At each reset the winner shows up in each board's "Previous Member of the Day /
 Week / Month" field (nothing separate is posted) and a configurable reward role moves to them.
 
+It also has a compact set of moderation tools: timeouts, warnings with automatic escalation,
+kicks, (temporary) bans, purge, a mod log with numbered cases, and leaderboard-specific tools
+(leaderboard bans, count resets, an anti-farm cooldown).
+
 It is built for one community server, runs anywhere Python runs, and stores
 everything in a single SQLite file.
 
@@ -26,11 +30,12 @@ everything in a single SQLite file.
 8. [Running under systemd](#running-under-systemd)
 9. [Persistent storage and backups](#persistent-storage-and-backups)
 10. [Slash commands](#slash-commands)
-11. [Logging and troubleshooting](#logging-and-troubleshooting)
-12. [Reliability design](#reliability-design)
-13. [Known limitations](#known-limitations)
-14. [Running the tests](#running-the-tests)
-15. [Manual test checklist](#manual-test-checklist)
+11. [Moderation](#moderation)
+12. [Logging and troubleshooting](#logging-and-troubleshooting)
+13. [Reliability design](#reliability-design)
+14. [Known limitations](#known-limitations)
+15. [Running the tests](#running-the-tests)
+16. [Manual test checklist](#manual-test-checklist)
 
 ---
 
@@ -60,17 +65,26 @@ everything in a single SQLite file.
 - **Crash safety**: resets and board reposts are persisted step by step and resume correctly after a
   crash or restart at any point.
 - **`/stats`** shows anyone's counts and ranks, using exactly the same ordering as the boards.
+- **Optional winner DM** (`/winnerdm on`): the winner of each reset gets a congratulation DM. Off by default.
+- **Moderation**: `/timeout`, `/untimeout`, `/warn` (with automatic timeouts at configurable warning
+  counts), `/kick`, `/ban` (optionally temporary), `/unban`, `/purge`, right-click menus, numbered
+  cases and a mod-log channel. See [Moderation](#moderation).
+- **Leaderboard moderation**: ban a user from the leaderboard (`/lbban`), reset someone's counts
+  (`/resetcounts`), and an optional anti-farm cooldown between counted messages (`/countcooldown`).
 
 ## How counting and ranking work
 
 **What counts.** Every guild message from a human (not a bot, not a webhook) whose type is `default`
 or `reply`, in a channel that isn't excluded. That includes attachment-only and sticker-only
-messages. Message content is never read. One message is one point, with no cooldown.
+messages. Message content is never read for counting. One message is one point. By default there is
+no cooldown; with `/countcooldown seconds:N` a message only counts if it comes at least N seconds
+after the author's previous *counted* message (measured by Discord's message timestamps).
 
 **What doesn't count.**
 - DMs, bot and webhook messages, and system messages (joins, pins, boosts, thread-created notices, etc.).
 - Messages in excluded channels or excluded categories.
 - Messages in threads or forum posts whose parent channel or category is excluded.
+- Messages from users banned from the leaderboard (`/lbban`), and messages inside the cooldown window.
 
 Edits never add points, and deleting a message does not remove its point.
 
@@ -131,21 +145,26 @@ views, all of which the bot relies on.
 3. Go to **OAuth2 → URL Generator**:
    - Scopes: **`bot`** and **`applications.commands`**.
    - Bot permissions: **Administrator** (as planned for this server). If you prefer least privilege, grant
-     **View Channels, Send Messages, Embed Links, Read Message History, Manage Roles** instead.
+     **View Channels, Send Messages, Embed Links, Read Message History, Manage Roles, Kick Members,
+     Ban Members, Manage Messages, Timeout Members** (Moderate Members) instead.
    - Open the generated URL and add the bot to your server. The URL looks like:
      ```
      https://discord.com/oauth2/authorize?client_id=YOUR_APPLICATION_ID&scope=bot+applications.commands&permissions=8
      ```
-     (`permissions=8` is Administrator; the least-privilege set above is `permissions=268520448`.)
+     (`permissions=8` is Administrator; the least-privilege set above is `permissions=1099780156422`.
+     Without the moderation features, `268520448` is enough.)
 
 ### Administrator does not bypass role hierarchy
 
 Even with Administrator, a bot can only assign or remove roles that sit **below its own highest
-role**. In **Server Settings → Roles**, drag the bot's role **above** the three reward roles (daily,
-weekly, monthly). Otherwise role changes fail with "Missing Permissions".
+role**, and can only time out, kick or ban members whose highest role is **below its own**. In
+**Server Settings → Roles**, drag the bot's role **above** the three reward roles (daily, weekly,
+monthly) **and above everyone it should be able to moderate**. Otherwise those actions fail with
+"Missing Permissions".
 
-The bot handles that gracefully: the error is logged and recorded on the reset, the reset retries
-with backoff, and nothing crashes. `/setrole` warns you immediately if it can't manage the role.
+The bot handles that gracefully: a reset logs the error, records it and retries with backoff, and
+nothing crashes. `/setrole` warns you immediately if it can't manage the role, and moderation
+commands refuse up front with a clear message ("My highest role isn't above …").
 
 ## Configuration
 
@@ -290,7 +309,9 @@ The SQLite file is the only state. Losing it loses all history, configuration an
 ## Slash commands
 
 All administrative commands require **Manage Server**. They are hidden from members without it
-(`default_permissions`) and also checked at runtime. Responses are ephemeral.
+(`default_permissions`) and also checked at runtime, because server admins can override command
+visibility per role. Responses are ephemeral. Moderation commands are listed in
+[Moderation](#moderation).
 
 | Command | What it does |
 |---|---|
@@ -302,10 +323,61 @@ All administrative commands require **Manage Server**. They are hidden from memb
 | `/setbanner set url:<https url>` | Sets the banner image. Only `https://` URLs on public hosts are accepted. The URL is never fetched by the bot. |
 | `/setbanner clear` | Removes the banner. |
 | `/forcereset period:<daily\|weekly\|monthly>` | **Testing helper.** Runs the real reset state machine on a synthetic period, from the start of the current period until now. Its key looks like `test-2026-03-10-20260310T180000123456`, so it can never collide with a scheduled reset. Nothing is posted, and test runs never appear in the boards' Previous field (that only shows real periods). It does move the real reward role (the next scheduled reset reconciles the role normally). Use it on a test server. |
+| `/winnerdm state:<on\|off>` | When on, the winner of each daily, weekly and monthly reset gets a congratulation DM. Off by default. Skipped quietly if their DMs are closed; never sent for `/forcereset` or for periods caught up after downtime. |
+| `/lbban user:<user> [reason]` | Bans someone from the leaderboard: hidden from all boards and `/stats`, can never win a reset, and new messages don't count. Their earlier counts are kept. Logged as a case. |
+| `/lbunban user:<user> [reason]` | Lifts it; their earlier counts show again. Messages sent while banned stay uncounted. Logged as a case. |
+| `/lbbans` | Lists leaderboard bans. |
+| `/resetcounts user:<user> period:<daily\|weekly\|monthly\|alltime>` | Deletes that user's counted messages for the **current** day, week or month (or all time), after a Confirm button. Because every board is built from the same daily counts, resetting a week also lowers their monthly and all-time totals. Logged as a case. Can't be undone. |
+| `/countcooldown seconds:<0-60>` | Anti-farm: a message only counts if it comes at least this long after the author's previous counted message. `0` (default) turns it off. |
 | `/stats [user]` | Anyone can use it. Shows Daily, Weekly, Monthly and All-Time counts and ranks for you or the given user, ephemerally. |
 
 `/setbanner` is a command group (`set` and `clear`) because Discord does not allow one command to
 have both a `url` option and a `clear` subcommand.
+
+## Moderation
+
+Every moderation command is server-only, hidden from members without the permission in the table
+(`default_permissions`), and checks that permission again at runtime. Where Discord performs the
+action as the bot, the bot's own permission is checked up front too. Replies are ephemeral.
+
+| Command | Permission | What it does |
+|---|---|---|
+| `/timeout user duration [reason]` | Timeout Members | Times a member out. Durations like `30s`, `10m`, `2h`, `7d`, `1h30m`; at most 28 days (Discord's limit). |
+| `/untimeout user [reason]` | Timeout Members | Ends a member's timeout. |
+| `/warn user reason` | Timeout Members | Records a warning as a case and DMs the member (if their DMs are closed, the warning still counts). May trigger an automatic timeout (below). |
+| `/warnings user` | Timeout Members | Lists the user's active warnings with case numbers. |
+| `/clearwarn case_id` · `/clearwarns user` | Timeout Members | Clears one or all warnings. They stop counting but stay in the case history. |
+| `/kick user [reason]` | Kick Members | Kicks a member. |
+| `/ban user [reason] [delete_message_days] [duration]` | Ban Members | Bans a user (they don't have to be in the server). `delete_message_days` 0-7 also deletes their recent messages. With `duration` (e.g. `7d`, up to 365 days) it's a **temporary ban**: the bot lifts it automatically, also after a restart. A permanent ban cancels an earlier tempban's pending unban. |
+| `/unban user_id [reason]` | Ban Members | Lifts a ban (paste the user ID) and cancels any pending automatic unban. |
+| `/purge amount [user]` | Manage Messages + Read Message History | Scans the newest 1-100 messages in this channel and bulk-deletes them, or only one user's among them. Skips messages older than 14 days (Discord can't bulk-delete them) and pinned messages, and says how many were skipped. |
+| `/warnconfig add count duration` · `remove count` · `list` | Manage Server | Automatic timeouts: when a member reaches **exactly** `count` active warnings, they're timed out for `duration` (max 28 days). It's its own case ("Auto: N warnings"). If it isn't possible (for example the member is an Administrator), the warning still stands and the reply and mod log say why. |
+| `/case view case_id` | Timeout Members | Shows a case (and whether a warning is still active, with a link to its mod-log entry). |
+| `/case reason case_id reason` | Timeout Members | Changes a case's reason and edits its mod-log entry to match. |
+| `/modlog set channel` · `/modlog clear` | Manage Server | Where every action is logged (keep it staff-only). Cases are recorded either way. |
+
+Right-click menus (Apps): **User → Warn**, **User → Timeout** (both Timeout Members) and **Message →
+Delete + warn** (Timeout Members + Manage Messages). Each opens a short form and runs exactly the
+same checks and actions as the slash commands. *Delete + warn* checks the hierarchy, deletes the
+message, then warns its author, and keeps up to 300 characters of the deleted message on the case
+for context (from the interaction itself; the bot still has no Message Content intent).
+
+**Safety rules** (all enforced before anything happens, all covered by tests):
+- Nobody can act on themselves, the bot, or the server owner.
+- The moderator's highest role must be **strictly above** the target's (the server owner is exempt).
+- The bot's highest role must be strictly above the target's for anything Discord performs (timeout,
+  kick, ban); otherwise you get a clear "move my role higher" message instead of a raw error.
+- Discord never lets bots time out members with the Administrator permission; that is refused up front.
+- Roles are always fetched fresh from Discord. If they can't be checked (network trouble), nothing
+  happens.
+- Order: the Discord action first, then the case. If Discord refuses, no case is written. If the case
+  can't be saved after Discord succeeded, the action still stands, the error is logged and the reply
+  says so.
+- The reason is passed to Discord, so it shows in **Server Settings → Audit Log** as
+  `moderator (id): reason` (the Audit Log shows the bot as the actor).
+
+**Mod log entries** show the case number, action, user (mention and ID), moderator, reason, duration
+and when it ends, and ping nobody. A failed mod-log post never fails the action.
 
 ## Logging and troubleshooting
 
@@ -327,6 +399,9 @@ log record as a second layer of protection.
 | A board message was deleted | It is reposted automatically at the next update (only that board, which ends up at the bottom). |
 | Counts seem a few seconds behind | Expected: counts are buffered and flushed every `FLUSH_INTERVAL_SECONDS`. |
 | A reset seems stuck | Check its `last_error` in the logs. Failing steps retry with backoff, and nothing is marked done until it really is. |
+| "My highest role isn't above …" on a moderation command | Move the bot's role above the member's highest role in Server Settings → Roles. |
+| "You can only … members whose highest role is below yours" | Working as intended: moderators can't act on equal or higher roles. The server owner can. |
+| A tempban didn't end | Check the logs for `Scheduled unban ... failed`. The bot retries with backoff; it needs Ban Members. |
 
 To inspect state directly: `sqlite3 data/leaderboard.db "SELECT id, period_type, period_key, status, winner_user_id, attempts, last_error FROM reset_runs ORDER BY id DESC LIMIT 20;"`
 
@@ -380,6 +455,13 @@ exactly four.
 `lb:pg:{board}:{page}`) and registered at startup, so buttons on old messages keep working after
 restarts.
 
+**Temporary bans.** Each tempban is a row in `scheduled_unbans`, checked by the scheduler every 30 s
+(and right after startup, so bans that expired while the bot was offline end promptly). The ban is
+lifted on Discord first; the row is then deleted and the unban case recorded in one transaction. If
+the bot dies in between, the next attempt sees "Unknown Ban", which counts as success. Other errors
+retry with backoff. A per-server lock shared with `/ban` and `/unban` makes sure an old schedule
+never lifts a newer ban.
+
 ## Known limitations
 
 - **Hard kills lose buffered counts.** A `kill -9`, OOM kill, power loss or forced container stop loses
@@ -416,6 +498,15 @@ restarts.
   Use a private test server for experiments. A test run that cannot be computed within a few minutes
   (for example because Discord is unreachable) is closed without a winner, because the day's counts
   would by then include messages sent after the test period.
+- **The count cooldown is per process.** The time of each user's last counted message is kept in
+  memory only, so after a restart everyone's next message counts regardless of the cooldown.
+- **Leaderboard bans aren't retroactive.** Messages sent while someone is banned are never counted, even
+  after `/lbunban`. A banned user who currently holds a reward role keeps it until the next reset
+  moves it, and an earlier win stays in a board's Previous field.
+- **`/resetcounts` works on whole days** of the current period and also lowers the larger boards
+  that include those days.
+- **Winner DMs** can, rarely, be sent twice: if the bot dies right after sending one and before
+  recording it. That was accepted over risking none at all.
 - **One process per database.** SQLite and the in-memory buffer assume exactly one running instance.
 - **All times are UTC.** Boundaries are not configurable per time zone.
 
@@ -440,6 +531,9 @@ Highlights:
   - four correctly ordered boards
   - no duplicate runs
 - **`test_ranking.py`** checks the tie-break against an independent brute-force replay.
+- **`test_moderation.py`** covers every safety rule per action, the case/mod-log ordering, warn
+  escalation, context menus, tempbans across restarts and crashes, leaderboard bans, count resets
+  and the cooldown.
 - **`test_interactions.py`** dispatches button clicks through discord.py's real `ViewStore` on a
   freshly constructed client, as after a restart.
 
@@ -483,3 +577,21 @@ the bot mid-reset). Don't run failure experiments in the production community.
     the token never appears.
 15. **Graceful shutdown:** send messages, stop the bot gracefully within a few seconds (`docker stop` /
     `systemctl stop` / Ctrl+C), restart, and confirm no counts were lost.
+16. **Moderation hierarchy:** with a moderator account, run `/kick`, `/timeout`, `/warn` and `/ban`
+    against (a) an alt with a lower role (works), (b) an alt with the same highest role (refused),
+    (c) an alt whose role is above the bot's but below the moderator's (refused with "move my role
+    higher"), and (d) `/timeout` on an alt with Administrator (refused cleanly).
+17. **Mod log and Audit Log:** `/modlog set` a staff channel. Each action posts a "Case #N" entry that
+    pings nobody, and Server Settings → Audit Log shows `moderator (id): reason`. `/case reason`
+    edits the entry.
+18. **Context menus:** right-click a member → Apps → Warn / Timeout, and a message → Apps → Delete +
+    warn. Each opens its form and the result matches the slash command. (If startup logs
+    `Failed to sync application commands`, nothing new appears at all; check that log line first.)
+19. **Warn escalation:** `/warnconfig add count:2 duration:10m`, warn an alt twice: the second warning
+    times them out ("Auto: 2 warnings").
+20. **Tempban:** `/ban user:<alt> duration:2m`, restart the bot, wait: the alt is unbanned and an
+    "Unban · Tempban expired" case appears.
+21. **Leaderboard ban:** `/lbban` someone on the boards: they disappear at once, `/stats` shows them
+    unranked, their messages stop counting, and they can't win the next reset. `/lbunban` brings
+    their old counts back.
+22. **Cooldown:** `/countcooldown seconds:10`, send several messages within 10 s: only the first counts.
