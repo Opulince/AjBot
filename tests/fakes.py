@@ -566,6 +566,8 @@ class App:
         services = build_services(config, db, fake, clock)
         await services.exclusions.load()
         await services.installs.load()
+        await services.lb_bans.load()
+        await services.cooldowns.load()
         return cls(services)
 
     async def crash(self) -> None:

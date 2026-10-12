@@ -39,7 +39,7 @@ from bot.discord_ops import (
     OpNotFound,
     with_retries,
 )
-from bot.periods import unix_timestamp
+from bot.periods import PeriodType, day_range, period_containing, unix_timestamp
 from bot.ui.modlog import build_case_embed, build_info_embed, clip, format_duration
 
 if TYPE_CHECKING:
@@ -605,6 +605,130 @@ async def purge(
     }
     case = await record_case(services, guild_id, "purge", target_id=user_id, actor=actor, reason=None, extra=extra)
     return f"Deleted {result.deleted} message(s){who}.{tail}{case_note(case)}"
+
+
+# ------------------------------------------------------ leaderboard moderation
+
+
+async def refresh_boards(services: "Services", guild_id: int) -> None:
+    """Edit the boards now so a leaderboard change shows immediately. Never raises."""
+    try:
+        async with services.locks.get(guild_id):
+            await services.boards.update_guild(guild_id)
+    except Exception:
+        log.exception("Board refresh after a leaderboard change failed for guild %s", guild_id)
+
+
+async def lb_ban(services: "Services", guild_id: int, actor: Actor, target_id: int, reason: str | None) -> str:
+    """Hide a user from every board, /stats and reset winners; stop counting their messages.
+
+    Their stored counts are kept (hidden at query time), so :func:`lb_unban`
+    restores them; messages sent while banned are never counted.
+    """
+    await check_target(
+        services, guild_id, actor, target_id, verb="ban from the leaderboard", bot_acts=False, require_member=False
+    )
+    added = await services.repo.add_lb_ban(
+        guild_id, target_id, moderator_id=actor.user_id, reason=reason, now=services.clock.now()
+    )
+    if not added:
+        raise ModError(f"<@{target_id}> is already banned from the leaderboard.")
+    services.lb_bans.set_banned(guild_id, target_id, True)
+    case = await record_case(services, guild_id, "lbban", target_id=target_id, actor=actor, reason=reason)
+    await refresh_boards(services, guild_id)
+    return (
+        f"<@{target_id}> is banned from the leaderboard: hidden from the boards and /stats, can't win, and new "
+        f"messages don't count. Their earlier counts are kept for if you lift it.{case_note(case)}"
+    )
+
+
+async def lb_unban(services: "Services", guild_id: int, actor: Actor, target_id: int, reason: str | None) -> str:
+    if not await services.repo.remove_lb_ban(guild_id, target_id):
+        raise ModError(f"<@{target_id}> isn't banned from the leaderboard.")
+    services.lb_bans.set_banned(guild_id, target_id, False)
+    case = await record_case(services, guild_id, "lbunban", target_id=target_id, actor=actor, reason=reason)
+    await refresh_boards(services, guild_id)
+    return (
+        f"<@{target_id}> is back on the leaderboard with their earlier counts. Messages sent while they were "
+        f"banned don't count.{case_note(case)}"
+    )
+
+
+async def list_lb_bans(services: "Services", guild_id: int) -> str:
+    bans = await services.repo.list_lb_bans(guild_id)
+    if not bans:
+        return "Nobody is banned from the leaderboard."
+    lines = [
+        f"• <@{b.user_id}> (`{b.user_id}`) · {_ts(b.created_at, 'd')} · by <@{b.moderator_id}>"
+        + (f" · {discord.utils.escape_markdown(clip(b.reason, 120))}" if b.reason else "")
+        for b in bans
+    ]
+    return fit_lines(f"Banned from the leaderboard ({len(bans)}):", lines)
+
+
+RESET_PERIODS = ("daily", "weekly", "monthly", "alltime")
+
+
+def reset_scope(period: str, now: datetime) -> tuple[str | None, str | None, str]:
+    """``(start_day, end_day, label)`` of the *current* period (``None`` days = all history)."""
+    if period == "alltime":
+        return None, None, "all-time"
+    if period not in RESET_PERIODS:
+        raise ModError("Pick daily, weekly, monthly or alltime.")
+    current = period_containing(PeriodType(period), now)
+    start_day, end_day = day_range(current.start, current.end)
+    return start_day, end_day, f"{period} ({current.key})"
+
+
+async def check_reset_counts(services: "Services", guild_id: int, actor: Actor, target_id: int, period: str) -> str:
+    """Validate a /resetcounts request before asking for confirmation; returns the scope label."""
+    _, _, label = reset_scope(period, services.clock.now())
+    await check_target(
+        services, guild_id, actor, target_id, verb="reset the counts of", bot_acts=False, require_member=False
+    )
+    return label
+
+
+async def reset_counts(services: "Services", guild_id: int, actor: Actor, target_id: int, period: str) -> str:
+    """Delete a user's counted messages for the current period (or all history).
+
+    The buffer is flushed first, under the guild lock (so no reset computes a
+    winner halfway): otherwise counts still in memory would be written back
+    after the delete and the reset would partly undo itself.
+    """
+    start_day, end_day, label = reset_scope(period, services.clock.now())
+    await check_target(
+        services, guild_id, actor, target_id, verb="reset the counts of", bot_acts=False, require_member=False
+    )
+    async with services.locks.get(guild_id):
+        if not await services.buffer.flush():
+            raise ModError(
+                "Recent messages couldn't be saved right now, so nothing was reset (they would have come back). "
+                "Try again in a minute."
+            )
+        deleted = await services.repo.delete_counts(guild_id, target_id, start_day, end_day)
+    case = await record_case(
+        services, guild_id, "resetcounts", target_id=target_id, actor=actor, reason=None,
+        extra={"period": label, "deleted_days": deleted},
+    )
+    await refresh_boards(services, guild_id)
+    if not deleted:
+        return f"<@{target_id}> had no counted messages in the {label} range; nothing to reset.{case_note(case)}"
+    return f"Reset <@{target_id}>'s {label} count ({deleted} day(s) of counts removed).{case_note(case)}"
+
+
+async def set_count_cooldown(services: "Services", guild_id: int, seconds: int) -> str:
+    if not 0 <= seconds <= 60:
+        raise ModError("The cooldown must be between 0 and 60 seconds.")
+    await services.repo.set_count_cooldown(guild_id, seconds, services.clock.now())
+    services.cooldowns.set_cooldown(guild_id, seconds)
+    log.info("Count cooldown for guild %s set to %ss", guild_id, seconds)
+    if seconds == 0:
+        return "Count cooldown turned off: every eligible message counts."
+    return (
+        f"Count cooldown set to {seconds}s: a message counts only if it comes at least {seconds}s after the "
+        "author's previous counted message."
+    )
 
 
 # --------------------------------------------------------- warn escalation

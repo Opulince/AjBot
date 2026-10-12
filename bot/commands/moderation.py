@@ -10,7 +10,7 @@ are thin: the logic and every safety rule live in :mod:`bot.moderation`.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Awaitable, Callable, Optional
+from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Optional
 
 import discord
 from discord import app_commands
@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 Reason = app_commands.Range[str, 1, mod.REASON_MAX]
+ResetPeriod = Literal["daily", "weekly", "monthly", "alltime"]
+CONFIRM_TIMEOUT = 60.0
 
 
 def actor_of(interaction: discord.Interaction) -> mod.Actor:
@@ -38,6 +40,36 @@ async def run_action(interaction: discord.Interaction, action: Callable[[], Awai
     except mod.ModError as exc:
         message = str(exc)
     await _reply(interaction, message)
+
+
+class ConfirmView(discord.ui.View):
+    """Confirm / Cancel for a destructive action; only the moderator who asked can press it."""
+
+    def __init__(self, invoker_id: int, action: Callable[[], Awaitable[str]], *, timeout: float = CONFIRM_TIMEOUT) -> None:
+        super().__init__(timeout=timeout)
+        self.invoker_id = invoker_id
+        self.action = action
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:  # type: ignore[override]
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message("Only the moderator who asked can confirm this.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Reset counts", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        self.stop()
+        await interaction.response.edit_message(content="Resetting…", view=None)
+        try:
+            message = await self.action()
+        except mod.ModError as exc:
+            message = str(exc)
+        await interaction.edit_original_response(content=message)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        self.stop()
+        await interaction.response.edit_message(content="Cancelled. Nothing was reset.", view=None)
 
 
 # ------------------------------------------------------------------ modals
@@ -428,6 +460,71 @@ def register_moderation_commands(tree: app_commands.CommandTree, services: "Serv
         await run_action(interaction, lambda: mod.edit_case_reason(services, interaction.guild_id, case_id, reason))
 
     tree.add_command(case)
+
+    # ---------------------------------------------- leaderboard moderation
+
+    @tree.command(name="lbban", description="Ban a user from the leaderboard (hidden, can't win, not counted)")
+    @app_commands.describe(user="User to remove from the leaderboard", reason="Shown in the mod log")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def lbban_cmd(interaction: discord.Interaction, user: discord.User, reason: Optional[Reason] = None) -> None:
+        assert interaction.guild_id is not None
+        await run_action(
+            interaction, lambda: mod.lb_ban(services, interaction.guild_id, actor_of(interaction), user.id, reason)
+        )
+
+    @tree.command(name="lbunban", description="Put a user back on the leaderboard (their earlier counts return)")
+    @app_commands.describe(user="User to restore", reason="Shown in the mod log")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def lbunban_cmd(interaction: discord.Interaction, user: discord.User, reason: Optional[Reason] = None) -> None:
+        assert interaction.guild_id is not None
+        await run_action(
+            interaction, lambda: mod.lb_unban(services, interaction.guild_id, actor_of(interaction), user.id, reason)
+        )
+
+    @tree.command(name="lbbans", description="List users banned from the leaderboard")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def lbbans_cmd(interaction: discord.Interaction) -> None:
+        assert interaction.guild_id is not None
+        await _reply(interaction, await mod.list_lb_bans(services, interaction.guild_id))
+
+    @tree.command(name="resetcounts", description="Delete a user's counted messages for the current period")
+    @app_commands.describe(user="Whose counts to reset", period="The current day, week or month, or all time")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def resetcounts_cmd(interaction: discord.Interaction, user: discord.User, period: ResetPeriod) -> None:
+        assert interaction.guild_id is not None
+        guild_id = interaction.guild_id
+        actor = actor_of(interaction)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            label = await mod.check_reset_counts(services, guild_id, actor, user.id, period)
+        except mod.ModError as exc:
+            await _reply(interaction, str(exc))
+            return
+        view = ConfirmView(actor.user_id, lambda: mod.reset_counts(services, guild_id, actor, user.id, period))
+        await interaction.followup.send(
+            f"Reset <@{user.id}>'s **{label}** count? Their counted messages in that range are deleted, which also "
+            "lowers every board that includes those days (a weekly reset lowers their monthly and all-time totals "
+            "too). This can't be undone.",
+            view=view,
+            ephemeral=True,
+        )
+
+    @tree.command(name="countcooldown", description="Minimum seconds between two counted messages of one user")
+    @app_commands.describe(seconds="0 turns it off (default); up to 60")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def countcooldown_cmd(interaction: discord.Interaction, seconds: app_commands.Range[int, 0, 60]) -> None:
+        assert interaction.guild_id is not None
+        await _reply(interaction, await mod.set_count_cooldown(services, interaction.guild_id, seconds))
 
     # ------------------------------------------------------- context menus
     # Discord allows 5 user and 5 message context menus per app; this adds 2 + 1.

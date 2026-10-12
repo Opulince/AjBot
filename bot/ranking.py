@@ -1,6 +1,8 @@
 """Leaderboard aggregation, tie-breaking and rank calculation.
 
-Ordering rule (used by boards, pagination, ``/stats`` and reset winners alike):
+Ordering rule (used by boards, pagination, ``/stats`` and reset winners alike;
+users banned from the leaderboard are left out of all of them, see
+``Repo.aggregate_counts``):
 
 1. Higher message total first.
 2. Equal totals: the user who *reached that final total first* ranks higher.
