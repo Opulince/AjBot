@@ -10,12 +10,14 @@ import pytest
 
 import bot.db.database as database_module
 from bot.db.database import LATEST_VERSION, Database, DatabaseError
+from bot.clock import to_iso
 from bot.db.repo import CountDelta, MemberUpdate, Repo
 from tests.conftest import GUILD, T0
 
 EXPECTED_TABLES = {
     "guild_config", "excluded_channels", "daily_counts", "members", "board_messages",
     "board_repost", "reset_runs", "role_holders",
+    "mod_cases", "lb_banned_users", "warn_thresholds", "scheduled_unbans",
 }
 
 
@@ -232,3 +234,65 @@ async def test_close_before_connect_finishes_wins(tmp_path: Path, monkeypatch: p
     assert not db.connected
     with pytest.raises(DatabaseError, match="closed"):
         await db.connect()
+
+
+async def test_upgrade_from_version_1_keeps_existing_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A database created by the previous release (schema 1) with real data upgrades to 2 in place."""
+    from datetime import timedelta
+
+    from bot.db.repo import RunStatus
+    from bot.periods import period_containing
+
+    path = tmp_path / "lb.db"
+    monkeypatch.setattr(database_module, "MIGRATIONS", database_module.MIGRATIONS[:1])
+    monkeypatch.setattr(database_module, "LATEST_VERSION", 1)
+    db = Database(path)
+    await db.connect()
+    try:
+        # Written with the statements the schema-1 release used (the current row mappers
+        # expect schema-2 columns, so they can't read a schema-1 guild_config row).
+        stamp = to_iso(T0)
+        async with db.transaction() as conn:
+            await conn.execute(
+                "INSERT INTO guild_config (guild_id, board_channel_id, role_daily_id, installed_at, repost_needed, "
+                "updated_at) VALUES (?, 100, 501, ?, 1, ?)",
+                (GUILD, stamp, stamp),
+            )
+        repo = Repo(db)
+        await repo.apply_count_batch(
+            [CountDelta(GUILD, 11, "2026-03-10", 7, 1234)], [MemberUpdate(GUILD, 11, "A", "a", T0)]
+        )
+        await repo.create_runs(GUILD, [period_containing("daily", T0 - timedelta(days=1))], T0)
+        assert await scalar(db, "PRAGMA user_version") == 1
+        assert await scalar(db, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'mod_cases'") == 0
+    finally:
+        await db.close()
+
+    monkeypatch.undo()
+    db = Database(path)
+    await db.connect()
+    repo = Repo(db)
+    try:
+        assert await scalar(db, "PRAGMA user_version") == LATEST_VERSION == 2
+        cfg = await repo.get_guild_config(GUILD)
+        assert cfg is not None and cfg.installed_at == T0 and cfg.role_daily_id == 501 and cfg.repost_needed
+        assert (cfg.modlog_channel_id, cfg.count_cooldown_seconds, cfg.winner_dm) == (None, 0, False)
+        rows = await repo.aggregate_counts(GUILD)
+        assert [(r.user_id, r.total, r.milestone_id) for r in rows] == [(11, 7, 1234)]
+        [run] = await repo.list_runs(GUILD)
+        assert run.status is RunStatus.PENDING and run.winner_dm_sent_at is None
+        # The new tables work on the upgraded file.
+        case = await repo.create_case(GUILD, "kick", target_id=11, moderator_id=5, reason="r", now=T0)
+        assert case.case_id == 1
+        await repo.set_count_cooldown(GUILD, 3, T0)
+        await repo.set_winner_dm(GUILD, True, T0)
+        await repo.set_modlog_channel(GUILD, 300, T0)
+        cfg = await repo.get_guild_config(GUILD)
+        assert cfg is not None and (cfg.modlog_channel_id, cfg.count_cooldown_seconds, cfg.winner_dm) == (300, 3, True)
+        async with db.read() as conn:
+            async with conn.execute("PRAGMA integrity_check") as cur:
+                assert (await cur.fetchone())[0] == "ok"
+            async with conn.execute("PRAGMA foreign_key_check") as cur:
+                assert await cur.fetchall() == []
+    finally:
+        await db.close()

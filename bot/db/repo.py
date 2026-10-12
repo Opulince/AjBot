@@ -66,9 +66,15 @@ _RUN_FIELDS = frozenset(
         "attempts",
         "last_error",
         "next_attempt_at",
+        "winner_dm_sent_at",
     }
 )
-_RUN_DATETIME_FIELDS = frozenset({"announce_started_at", "role_started_at", "next_attempt_at"})
+_RUN_DATETIME_FIELDS = frozenset({"announce_started_at", "role_started_at", "next_attempt_at", "winner_dm_sent_at"})
+
+# Actions a moderation case may record (mirrors the mod_cases CHECK constraint).
+CASE_ACTIONS = frozenset(
+    {"warn", "timeout", "untimeout", "kick", "ban", "unban", "purge", "lbban", "lbunban", "resetcounts"}
+)
 
 
 @dataclass(frozen=True)
@@ -81,6 +87,9 @@ class GuildConfig:
     role_monthly_id: int | None
     installed_at: datetime | None
     repost_needed: bool
+    modlog_channel_id: int | None = None
+    count_cooldown_seconds: int = 0
+    winner_dm: bool = False
 
     def role_for(self, ptype: PeriodType | str) -> int | None:
         ptype = PeriodType(ptype)
@@ -179,6 +188,7 @@ class ResetRun:
     next_attempt_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    winner_dm_sent_at: datetime | None = None
 
     @property
     def terminal(self) -> bool:
@@ -205,6 +215,48 @@ class RoleHolder:
     since_key: str
 
 
+@dataclass(frozen=True)
+class ModCase:
+    guild_id: int
+    case_id: int
+    action: str
+    target_id: int | None
+    moderator_id: int
+    reason: str | None
+    duration_seconds: int | None
+    extra: dict[str, Any]
+    active: bool
+    modlog_channel_id: int | None
+    modlog_message_id: int | None
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class LbBan:
+    guild_id: int
+    user_id: int
+    moderator_id: int
+    reason: str | None
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class WarnThreshold:
+    warn_count: int
+    timeout_seconds: int
+
+
+@dataclass(frozen=True)
+class ScheduledUnban:
+    guild_id: int
+    user_id: int
+    unban_at: datetime
+    case_id: int | None
+    attempts: int
+    last_error: str | None
+    next_attempt_at: datetime | None
+
+
 def _dt(value: str | None) -> datetime | None:
     return from_iso(value) if value is not None else None
 
@@ -219,6 +271,9 @@ def _guild_config(row: aiosqlite.Row) -> GuildConfig:
         role_monthly_id=row["role_monthly_id"],
         installed_at=_dt(row["installed_at"]),
         repost_needed=bool(row["repost_needed"]),
+        modlog_channel_id=row["modlog_channel_id"],
+        count_cooldown_seconds=int(row["count_cooldown_seconds"]),
+        winner_dm=bool(row["winner_dm"]),
     )
 
 
@@ -262,6 +317,36 @@ def _run(row: aiosqlite.Row) -> ResetRun:
         next_attempt_at=_dt(row["next_attempt_at"]),
         created_at=from_iso(row["created_at"]),
         updated_at=from_iso(row["updated_at"]),
+        winner_dm_sent_at=_dt(row["winner_dm_sent_at"]),
+    )
+
+
+def _case(row: aiosqlite.Row) -> ModCase:
+    return ModCase(
+        guild_id=row["guild_id"],
+        case_id=row["case_id"],
+        action=row["action"],
+        target_id=row["target_id"],
+        moderator_id=row["moderator_id"],
+        reason=row["reason"],
+        duration_seconds=row["duration_seconds"],
+        extra=json.loads(row["extra"]) if row["extra"] else {},
+        active=bool(row["active"]),
+        modlog_channel_id=row["modlog_channel_id"],
+        modlog_message_id=row["modlog_message_id"],
+        created_at=from_iso(row["created_at"]),
+    )
+
+
+def _unban(row: aiosqlite.Row) -> ScheduledUnban:
+    return ScheduledUnban(
+        guild_id=row["guild_id"],
+        user_id=row["user_id"],
+        unban_at=from_iso(row["unban_at"]),
+        case_id=row["case_id"],
+        attempts=row["attempts"],
+        last_error=row["last_error"],
+        next_attempt_at=_dt(row["next_attempt_at"]),
     )
 
 
@@ -335,6 +420,42 @@ class Repo:
             await conn.execute(
                 "UPDATE guild_config SET banner_url = ?, updated_at = ? WHERE guild_id = ?",
                 (url, stamp, guild_id),
+            )
+
+    async def set_modlog_channel(self, guild_id: int, channel_id: int | None, now: datetime) -> None:
+        stamp = to_iso(now)
+        async with self.db.transaction() as conn:
+            await self._ensure_guild_row(conn, guild_id, stamp)
+            await conn.execute(
+                "UPDATE guild_config SET modlog_channel_id = ?, updated_at = ? WHERE guild_id = ?",
+                (channel_id, stamp, guild_id),
+            )
+
+    async def set_count_cooldown(self, guild_id: int, seconds: int, now: datetime) -> None:
+        if seconds < 0:
+            raise ValueError("cooldown cannot be negative")
+        stamp = to_iso(now)
+        async with self.db.transaction() as conn:
+            await self._ensure_guild_row(conn, guild_id, stamp)
+            await conn.execute(
+                "UPDATE guild_config SET count_cooldown_seconds = ?, updated_at = ? WHERE guild_id = ?",
+                (seconds, stamp, guild_id),
+            )
+
+    async def load_all_cooldowns(self) -> dict[int, int]:
+        async with self.db.read() as conn:
+            rows = await _fetchall(
+                conn, "SELECT guild_id, count_cooldown_seconds FROM guild_config WHERE count_cooldown_seconds > 0"
+            )
+        return {r["guild_id"]: int(r["count_cooldown_seconds"]) for r in rows}
+
+    async def set_winner_dm(self, guild_id: int, enabled: bool, now: datetime) -> None:
+        stamp = to_iso(now)
+        async with self.db.transaction() as conn:
+            await self._ensure_guild_row(conn, guild_id, stamp)
+            await conn.execute(
+                "UPDATE guild_config SET winner_dm = ?, updated_at = ? WHERE guild_id = ?",
+                (1 if enabled else 0, stamp, guild_id),
             )
 
     # -------------------------------------------------------------- exclusions
@@ -914,3 +1035,287 @@ class Repo:
                 (guild_id, PeriodType(ptype).value, period_key),
             )
         return _run(row) if row else None
+
+    # -------------------------------------------------------------- moderation
+
+    @staticmethod
+    async def _insert_case(
+        conn: aiosqlite.Connection,
+        guild_id: int,
+        action: str,
+        *,
+        target_id: int | None,
+        moderator_id: int,
+        reason: str | None,
+        now: datetime,
+        duration_seconds: int | None,
+        extra: Mapping[str, Any] | None,
+    ) -> ModCase:
+        """Insert a case with the next per-guild number. The caller's transaction serialises numbering."""
+        if action not in CASE_ACTIONS:
+            raise ValueError(f"invalid case action {action!r}")
+        row = await _fetchone(conn, "SELECT COALESCE(MAX(case_id), 0) + 1 AS next FROM mod_cases WHERE guild_id = ?", (guild_id,))
+        assert row is not None
+        case_id = int(row["next"])
+        await conn.execute(
+            "INSERT INTO mod_cases (guild_id, case_id, action, target_id, moderator_id, reason, duration_seconds, "
+            "  extra, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                guild_id,
+                case_id,
+                action,
+                target_id,
+                moderator_id,
+                reason,
+                duration_seconds,
+                json.dumps(dict(extra)) if extra else None,
+                to_iso(now),
+            ),
+        )
+        created = await _fetchone(conn, "SELECT * FROM mod_cases WHERE guild_id = ? AND case_id = ?", (guild_id, case_id))
+        assert created is not None
+        return _case(created)
+
+    async def create_case(
+        self,
+        guild_id: int,
+        action: str,
+        *,
+        target_id: int | None,
+        moderator_id: int,
+        reason: str | None,
+        now: datetime,
+        duration_seconds: int | None = None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> ModCase:
+        async with self.db.transaction() as conn:
+            return await self._insert_case(
+                conn, guild_id, action, target_id=target_id, moderator_id=moderator_id, reason=reason,
+                now=now, duration_seconds=duration_seconds, extra=extra,
+            )
+
+    async def create_warning(
+        self, guild_id: int, user_id: int, *, moderator_id: int, reason: str | None, now: datetime
+    ) -> tuple[ModCase, int]:
+        """Record a warning and return it with the user's active warning count (including it), atomically."""
+        async with self.db.transaction() as conn:
+            case = await self._insert_case(
+                conn, guild_id, "warn", target_id=user_id, moderator_id=moderator_id, reason=reason,
+                now=now, duration_seconds=None, extra=None,
+            )
+            row = await _fetchone(
+                conn,
+                "SELECT COUNT(*) AS n FROM mod_cases WHERE guild_id = ? AND target_id = ? AND action = 'warn' AND active = 1",
+                (guild_id, user_id),
+            )
+        assert row is not None
+        return case, int(row["n"])
+
+    async def get_case(self, guild_id: int, case_id: int) -> ModCase | None:
+        async with self.db.read() as conn:
+            row = await _fetchone(conn, "SELECT * FROM mod_cases WHERE guild_id = ? AND case_id = ?", (guild_id, case_id))
+        return _case(row) if row else None
+
+    async def set_case_modlog(self, guild_id: int, case_id: int, channel_id: int, message_id: int) -> None:
+        async with self.db.transaction() as conn:
+            await conn.execute(
+                "UPDATE mod_cases SET modlog_channel_id = ?, modlog_message_id = ? WHERE guild_id = ? AND case_id = ?",
+                (channel_id, message_id, guild_id, case_id),
+            )
+
+    async def update_case_reason(self, guild_id: int, case_id: int, reason: str | None) -> ModCase | None:
+        async with self.db.transaction() as conn:
+            cur = await conn.execute(
+                "UPDATE mod_cases SET reason = ? WHERE guild_id = ? AND case_id = ?", (reason, guild_id, case_id)
+            )
+            if cur.rowcount != 1:
+                return None
+            row = await _fetchone(conn, "SELECT * FROM mod_cases WHERE guild_id = ? AND case_id = ?", (guild_id, case_id))
+        return _case(row) if row else None
+
+    async def active_warnings(self, guild_id: int, user_id: int) -> list[ModCase]:
+        async with self.db.read() as conn:
+            rows = await _fetchall(
+                conn,
+                "SELECT * FROM mod_cases WHERE guild_id = ? AND target_id = ? AND action = 'warn' AND active = 1 "
+                "ORDER BY case_id",
+                (guild_id, user_id),
+            )
+        return [_case(r) for r in rows]
+
+    async def clear_warning(self, guild_id: int, case_id: int) -> ModCase | None:
+        """Deactivate one active warning. Returns it, or ``None`` if it is not an active warning."""
+        async with self.db.transaction() as conn:
+            cur = await conn.execute(
+                "UPDATE mod_cases SET active = 0 WHERE guild_id = ? AND case_id = ? AND action = 'warn' AND active = 1",
+                (guild_id, case_id),
+            )
+            if cur.rowcount != 1:
+                return None
+            row = await _fetchone(conn, "SELECT * FROM mod_cases WHERE guild_id = ? AND case_id = ?", (guild_id, case_id))
+        return _case(row) if row else None
+
+    async def clear_warnings(self, guild_id: int, user_id: int) -> int:
+        """Deactivate every active warning of a user; returns how many."""
+        async with self.db.transaction() as conn:
+            cur = await conn.execute(
+                "UPDATE mod_cases SET active = 0 WHERE guild_id = ? AND target_id = ? AND action = 'warn' AND active = 1",
+                (guild_id, user_id),
+            )
+            return max(cur.rowcount, 0)
+
+    # --------------------------------------------------------- leaderboard bans
+
+    async def add_lb_ban(
+        self, guild_id: int, user_id: int, *, moderator_id: int, reason: str | None, now: datetime
+    ) -> bool:
+        async with self.db.transaction() as conn:
+            cur = await conn.execute(
+                "INSERT OR IGNORE INTO lb_banned_users (guild_id, user_id, moderator_id, reason, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (guild_id, user_id, moderator_id, reason, to_iso(now)),
+            )
+            return cur.rowcount > 0
+
+    async def remove_lb_ban(self, guild_id: int, user_id: int) -> bool:
+        async with self.db.transaction() as conn:
+            cur = await conn.execute(
+                "DELETE FROM lb_banned_users WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+            )
+            return cur.rowcount > 0
+
+    async def list_lb_bans(self, guild_id: int) -> list[LbBan]:
+        async with self.db.read() as conn:
+            rows = await _fetchall(
+                conn, "SELECT * FROM lb_banned_users WHERE guild_id = ? ORDER BY created_at, user_id", (guild_id,)
+            )
+        return [
+            LbBan(r["guild_id"], r["user_id"], r["moderator_id"], r["reason"], from_iso(r["created_at"])) for r in rows
+        ]
+
+    async def load_all_lb_bans(self) -> dict[int, set[int]]:
+        async with self.db.read() as conn:
+            rows = await _fetchall(conn, "SELECT guild_id, user_id FROM lb_banned_users")
+        result: dict[int, set[int]] = {}
+        for r in rows:
+            result.setdefault(r["guild_id"], set()).add(r["user_id"])
+        return result
+
+    async def delete_counts(self, guild_id: int, user_id: int, start_day: str | None, end_day: str | None) -> int:
+        """Delete a user's daily buckets in ``[start_day, end_day)`` (both ``None``: all history)."""
+        sql = "DELETE FROM daily_counts WHERE guild_id = ? AND user_id = ?"
+        params: list[Any] = [guild_id, user_id]
+        if start_day is not None and end_day is not None:
+            sql += " AND day >= ? AND day < ?"
+            params += [start_day, end_day]
+        elif start_day is not None or end_day is not None:
+            raise ValueError("start_day and end_day must be given together")
+        async with self.db.transaction() as conn:
+            cur = await conn.execute(sql, params)
+            return max(cur.rowcount, 0)
+
+    # ---------------------------------------------------------- warn thresholds
+
+    async def set_warn_threshold(self, guild_id: int, warn_count: int, timeout_seconds: int) -> None:
+        async with self.db.transaction() as conn:
+            await conn.execute(
+                "INSERT INTO warn_thresholds (guild_id, warn_count, timeout_seconds) VALUES (?, ?, ?) "
+                "ON CONFLICT (guild_id, warn_count) DO UPDATE SET timeout_seconds = excluded.timeout_seconds",
+                (guild_id, warn_count, timeout_seconds),
+            )
+
+    async def remove_warn_threshold(self, guild_id: int, warn_count: int) -> bool:
+        async with self.db.transaction() as conn:
+            cur = await conn.execute(
+                "DELETE FROM warn_thresholds WHERE guild_id = ? AND warn_count = ?", (guild_id, warn_count)
+            )
+            return cur.rowcount > 0
+
+    async def list_warn_thresholds(self, guild_id: int) -> list[WarnThreshold]:
+        async with self.db.read() as conn:
+            rows = await _fetchall(
+                conn, "SELECT warn_count, timeout_seconds FROM warn_thresholds WHERE guild_id = ? ORDER BY warn_count",
+                (guild_id,),
+            )
+        return [WarnThreshold(r["warn_count"], r["timeout_seconds"]) for r in rows]
+
+    async def get_warn_threshold(self, guild_id: int, warn_count: int) -> int | None:
+        async with self.db.read() as conn:
+            row = await _fetchone(
+                conn, "SELECT timeout_seconds FROM warn_thresholds WHERE guild_id = ? AND warn_count = ?",
+                (guild_id, warn_count),
+            )
+        return int(row["timeout_seconds"]) if row else None
+
+    # --------------------------------------------------------- scheduled unbans
+
+    async def schedule_unban(self, guild_id: int, user_id: int, unban_at: datetime, case_id: int | None) -> None:
+        """Create or replace the user's scheduled unban (a new ban restarts the clock and the retries)."""
+        async with self.db.transaction() as conn:
+            await conn.execute(
+                "INSERT INTO scheduled_unbans (guild_id, user_id, unban_at, case_id) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (guild_id, user_id) DO UPDATE SET unban_at = excluded.unban_at, "
+                "  case_id = excluded.case_id, attempts = 0, last_error = NULL, next_attempt_at = NULL",
+                (guild_id, user_id, to_iso(unban_at), case_id),
+            )
+
+    async def delete_scheduled_unban(self, guild_id: int, user_id: int) -> bool:
+        async with self.db.transaction() as conn:
+            cur = await conn.execute(
+                "DELETE FROM scheduled_unbans WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+            )
+            return cur.rowcount > 0
+
+    async def get_scheduled_unban(self, guild_id: int, user_id: int) -> ScheduledUnban | None:
+        async with self.db.read() as conn:
+            row = await _fetchone(
+                conn, "SELECT * FROM scheduled_unbans WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+            )
+        return _unban(row) if row else None
+
+    async def due_unbans(self, now: datetime, limit: int = 50) -> list[ScheduledUnban]:
+        stamp = to_iso(now)
+        async with self.db.read() as conn:
+            rows = await _fetchall(
+                conn,
+                "SELECT * FROM scheduled_unbans WHERE unban_at <= ? "
+                "AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY unban_at, guild_id, user_id LIMIT ?",
+                (stamp, stamp, limit),
+            )
+        return [_unban(r) for r in rows]
+
+    async def record_unban_error(
+        self, guild_id: int, user_id: int, error: str, next_attempt_at: datetime
+    ) -> ScheduledUnban | None:
+        async with self.db.transaction() as conn:
+            await conn.execute(
+                "UPDATE scheduled_unbans SET attempts = attempts + 1, last_error = ?, next_attempt_at = ? "
+                "WHERE guild_id = ? AND user_id = ?",
+                (error[:1000], to_iso(next_attempt_at), guild_id, user_id),
+            )
+            row = await _fetchone(
+                conn, "SELECT * FROM scheduled_unbans WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+            )
+        return _unban(row) if row else None
+
+    async def complete_scheduled_unban(
+        self, unban: ScheduledUnban, *, moderator_id: int, reason: str, now: datetime
+    ) -> ModCase | None:
+        """Delete the schedule and record the unban case in one transaction.
+
+        Only the exact row that was processed is completed: if the user was
+        banned again meanwhile (new ``unban_at``) or the schedule was removed,
+        nothing happens and ``None`` is returned.
+        """
+        async with self.db.transaction() as conn:
+            cur = await conn.execute(
+                "DELETE FROM scheduled_unbans WHERE guild_id = ? AND user_id = ? AND unban_at = ?",
+                (unban.guild_id, unban.user_id, to_iso(unban.unban_at)),
+            )
+            if cur.rowcount != 1:
+                return None
+            return await self._insert_case(
+                conn, unban.guild_id, "unban", target_id=unban.user_id, moderator_id=moderator_id, reason=reason,
+                now=now, duration_seconds=None,
+                extra={"ban_case": unban.case_id} if unban.case_id is not None else None,
+            )
