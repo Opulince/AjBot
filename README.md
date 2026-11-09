@@ -66,9 +66,9 @@ everything in a single SQLite file.
   crash or restart at any point.
 - **`/stats`** shows anyone's counts and ranks, using exactly the same ordering as the boards.
 - **Optional winner DM** (`/winnerdm on`): the winner of each reset gets a congratulation DM. Off by default.
-- **Moderation**: `/timeout`, `/untimeout`, `/warn` (with automatic timeouts at configurable warning
-  counts), `/kick`, `/ban` (optionally temporary), `/unban`, `/purge`, right-click menus, numbered
-  cases and a mod-log channel. See [Moderation](#moderation).
+- **Moderation**: `/timeout`, `/untimeout` (or `/mute`, `/unmute`), `/warn` (with automatic
+  timeouts at configurable warning counts), `/kick`, `/ban` (optionally temporary), `/unban`,
+  `/purge`, right-click menus, numbered cases and a mod-log channel. See [Moderation](#moderation).
 - **Leaderboard moderation**: ban a user from the leaderboard (`/lbban`), reset someone's counts
   (`/resetcounts`), and an optional anti-farm cooldown between counted messages (`/countcooldown`).
 

@@ -10,7 +10,7 @@ are thin: the logic and every safety rule live in :mod:`bot.moderation`.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, Optional, TypeVar
 
 import discord
 from discord import app_commands
@@ -26,6 +26,18 @@ log = logging.getLogger(__name__)
 Reason = app_commands.Range[str, 1, mod.REASON_MAX]
 ResetPeriod = Literal["daily", "weekly", "monthly", "alltime"]
 CONFIRM_TIMEOUT = 60.0
+DURATION_HELP = "How long: 30s, 10m, 2h, 7d, 1h30m … (max 28d)"
+REASON_HELP = "Shown in the mod log and the Audit Log"
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def _timeout_gate(func: F) -> F:
+    """The gate shared by /timeout, /untimeout and their /mute, /unmute aliases, so they can't drift apart."""
+    func = app_commands.checks.bot_has_permissions(moderate_members=True)(func)
+    func = app_commands.checks.has_permissions(moderate_members=True)(func)
+    func = app_commands.default_permissions(moderate_members=True)(func)
+    return app_commands.guild_only()(func)
 
 
 def actor_of(interaction: discord.Interaction) -> mod.Actor:
@@ -175,15 +187,8 @@ def register_moderation_commands(tree: app_commands.CommandTree, services: "Serv
     # ------------------------------------------------------------ timeouts
 
     @tree.command(name="timeout", description="Time a member out (they can't chat, react or join voice)")
-    @app_commands.describe(
-        user="Member to time out",
-        duration="How long: 30s, 10m, 2h, 7d, 1h30m … (max 28d)",
-        reason="Shown in the mod log and the Audit Log",
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(moderate_members=True)
-    @app_commands.checks.has_permissions(moderate_members=True)
-    @app_commands.checks.bot_has_permissions(moderate_members=True)
+    @app_commands.describe(user="Member to time out", duration=DURATION_HELP, reason=REASON_HELP)
+    @_timeout_gate
     async def timeout_cmd(
         interaction: discord.Interaction, user: discord.Member, duration: str, reason: Optional[Reason] = None
     ) -> None:
@@ -199,11 +204,8 @@ def register_moderation_commands(tree: app_commands.CommandTree, services: "Serv
         )
 
     @tree.command(name="untimeout", description="Remove a member's timeout")
-    @app_commands.describe(user="Member whose timeout ends now", reason="Shown in the mod log and the Audit Log")
-    @app_commands.guild_only()
-    @app_commands.default_permissions(moderate_members=True)
-    @app_commands.checks.has_permissions(moderate_members=True)
-    @app_commands.checks.bot_has_permissions(moderate_members=True)
+    @app_commands.describe(user="Member whose timeout ends now", reason=REASON_HELP)
+    @_timeout_gate
     async def untimeout_cmd(interaction: discord.Interaction, user: discord.Member, reason: Optional[Reason] = None) -> None:
         assert interaction.guild_id is not None
         await run_action(
@@ -213,26 +215,16 @@ def register_moderation_commands(tree: app_commands.CommandTree, services: "Serv
     # /mute and /unmute are the same as /timeout and /untimeout (Discord's timeout is its mute).
 
     @tree.command(name="mute", description="Mute a member (a Discord timeout: no chat, reactions or voice)")
-    @app_commands.describe(
-        user="Member to mute",
-        duration="How long: 30s, 10m, 2h, 7d, 1h30m … (max 28d)",
-        reason="Shown in the mod log and the Audit Log",
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(moderate_members=True)
-    @app_commands.checks.has_permissions(moderate_members=True)
-    @app_commands.checks.bot_has_permissions(moderate_members=True)
+    @app_commands.describe(user="Member to mute", duration=DURATION_HELP, reason=REASON_HELP)
+    @_timeout_gate
     async def mute_cmd(
         interaction: discord.Interaction, user: discord.Member, duration: str, reason: Optional[Reason] = None
     ) -> None:
         await timeout_cmd.callback(interaction, user, duration, reason)
 
     @tree.command(name="unmute", description="Unmute a member (ends their timeout)")
-    @app_commands.describe(user="Member to unmute", reason="Shown in the mod log and the Audit Log")
-    @app_commands.guild_only()
-    @app_commands.default_permissions(moderate_members=True)
-    @app_commands.checks.has_permissions(moderate_members=True)
-    @app_commands.checks.bot_has_permissions(moderate_members=True)
+    @app_commands.describe(user="Member to unmute", reason=REASON_HELP)
+    @_timeout_gate
     async def unmute_cmd(interaction: discord.Interaction, user: discord.Member, reason: Optional[Reason] = None) -> None:
         await untimeout_cmd.callback(interaction, user, reason)
 
@@ -297,7 +289,7 @@ def register_moderation_commands(tree: app_commands.CommandTree, services: "Serv
 
     @tree.command(name="ban", description="Ban a user, optionally for a limited time")
     @app_commands.describe(
-        user="User to ban",
+        user="User to ban (they don't have to be in the server)",
         reason="Shown in the mod log and the Audit Log",
         delete_message_days="Also delete their messages from the last 0-7 days (default 0)",
         duration="Temporary ban: 1h, 7d, 30d … up to 365d (leave empty for a permanent ban)",

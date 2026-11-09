@@ -760,6 +760,17 @@ async def test_moderation_commands_are_gated_twice(app: App) -> None:
         days = commands["ban"].get_parameter("delete_message_days")  # type: ignore[union-attr]
         assert (days.min_value, days.max_value, days.default) == (0, 7, 0)
         assert tree.get_command("timeout").to_dict(tree)  # type: ignore[union-attr]  # serialises for sync
+        # The aliases take exactly the same options as the commands they stand for.
+        def shape(name: str) -> list[tuple[Any, ...]]:
+            return [
+                (p.name, p.type, p.required, p.min_value, p.max_value, p.default)
+                for p in commands[name].parameters  # type: ignore[union-attr]
+            ]
+
+        assert shape("mute") == shape("timeout") and shape("unmute") == shape("untimeout")
+        for alias, original in (("mute", "timeout"), ("unmute", "untimeout")):
+            assert commands[alias].default_permissions == commands[original].default_permissions
+            assert commands[alias].guild_only == commands[original].guild_only
     finally:
         await client.close()
 
